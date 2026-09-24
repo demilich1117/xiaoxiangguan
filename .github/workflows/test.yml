@@ -19,5 +19,5 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - run: python -m pip install -r requirements.txt
+      - run: python -m pip install -r requirements.txt reportlab
       - run: npm test
