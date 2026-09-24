@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240" role="img" aria-labelledby="title desc">
+  <title id="title">Butterfly Peony logo</title>
+  <desc id="desc">A modern Japanese web UI logo combining butterfly wings and peony petals.</desc>
+  <path d="M119 104C96 60 50 43 26 62c-22 18-12 55 20 77 26 18 53 21 73 2Z" fill="#D9A7A3"/>
+  <path d="M121 104c23-44 69-61 93-42 22 18 12 55-20 77-26 18-53 21-73 2Z" fill="#D9A7A3"/>
+  <path d="M119 104c-13-30-43-48-58-35-14 12-4 35 18 49 16 10 29 13 40 10Z" fill="#B4C6BC"/>
+  <path d="M121 104c13-30 43-48 58-35 14 12 4 35-18 49-16 10-29 13-40 10Z" fill="#B4C6BC"/>
+  <path d="M120 91c-9 12-13 24-13 35 0 15 6 27 13 37 7-10 13-22 13-37 0-11-4-23-13-35Z" fill="#252525"/>
+  <circle cx="120" cy="79" r="7" fill="#252525"/>
+  <path d="M115 73 100 56M125 73l15-17" stroke="#252525" stroke-width="4" stroke-linecap="round"/>
+</svg>

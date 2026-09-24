@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>瀟湘館</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/butterfly-peony-logo.svg"/>
+  <link rel="stylesheet" href="/styles.css?v=1.8.0"/>
+  <link rel="stylesheet" href="/settings.css?v=1.8.0"/>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><img class="brand-logo" src="/assets/butterfly-peony-logo.svg" alt=""/><strong>瀟湘館</strong></div>
+      <nav id="main-nav">
+        <button class="nav-item active" data-view="library"><span aria-hidden="true">01</span>书库</button>
+        <button class="nav-item" data-view="tasks"><span aria-hidden="true">02</span>任务</button>
+        <button class="nav-item" data-view="glossary"><span aria-hidden="true">03</span>阅读质量</button>
+        <button class="nav-item" data-view="exports"><span aria-hidden="true">04</span>导出</button>
+        <button class="nav-item" data-view="settings"><span aria-hidden="true">05</span>设置</button>
+      </nav>
+      <div class="sidebar-foot"><span class="foot-rule" aria-hidden="true"></span><div id="local-status" class="local-status">正在检查本地能力…</div><small>资料保存在本机</small></div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div><p class="eyebrow" id="eyebrow">本地书库</p><h1 id="page-title">翻译项目</h1></div>
+        <div class="top-actions"><label class="search"><span class="sr-only">搜索作品或作者</span><input id="search" placeholder="搜索作品或作者"/></label><button class="primary" id="import-button">＋ 导入书籍</button></div>
+      </header>
+      <div class="demo-banner" id="demo-banner"><strong>演示数据</strong><span>当前示例仅用于体验界面；真实文件和译文不会自动上传。</span><button id="dismiss-demo">知道了</button></div>
+      <section id="content" class="content"></section>
+    </main>
+  </div>
+
+  <dialog id="import-dialog">
+    <form id="import-form" method="dialog" autocomplete="off">
+      <div class="dialog-head"><div><p class="eyebrow">新建项目</p><h2>导入书籍</h2></div><button class="icon-button" type="button" data-close-dialog="import-dialog">×</button></div>
+      <label class="drop-zone" id="drop-zone"><input id="book-file" type="file" accept=".pdf,.epub,.azw3" required/><strong>选择 PDF、EPUB 或 AZW3</strong><span id="file-hint">原文件会复制到本地书库，不会被修改</span></label>
+      <div class="form-grid"><label>书名<input id="book-title" placeholder="可在选择文件后修改"/></label><label>作者<input id="book-author" placeholder="可留空"/></label></div>
+      <div class="form-grid"><label>原文语种<select id="book-language"></select></label><label>翻译风格<select id="book-profile"><option>自动判断</option><option>现代文学</option><option>古典文学</option><option>学术文献</option></select></label></div>
+      <div class="notice">AZW3 仅支持无 DRM 文件，并需要安装 Calibre。导入后不会自动开始全书翻译。</div>
+      <div class="dialog-actions"><button type="button" data-close-dialog="import-dialog">取消</button><button class="primary" id="confirm-import" type="submit">导入到本地书库</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="edit-book-dialog">
+    <form id="edit-book-form" method="dialog" autocomplete="off">
+      <div class="dialog-head"><div><p class="eyebrow">BOOK DETAILS</p><h2>编辑作品资料</h2></div><button class="icon-button" type="button" data-close-dialog="edit-book-dialog">×</button></div>
+      <label>书名<input id="edit-book-title" required/></label>
+      <label>作者<input id="edit-book-author"/></label>
+      <div class="form-grid"><label>原文语种<select id="edit-book-language"></select></label><label>翻译风格<select id="edit-book-profile"><option>自动判断</option><option>现代文学</option><option>古典文学</option><option>学术文献</option></select></label></div>
+      <div class="notice">修改后会同步到该作品的持久化项目状态；不会改写原始电子书文件。</div>
+      <div class="dialog-actions"><button type="button" data-close-dialog="edit-book-dialog">取消</button><button class="primary" type="submit">保存资料</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast"></div>
+  <script type="module" src="/app.js?v=1.8.0"></script>
+</body>
+</html>

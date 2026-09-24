@@ -1,0 +1,21 @@
+import assert from "node:assert/strict";
+import { canAutoRevise, canAutoReviseFromEvidence, preserveChapterRevisionState } from "../lib/revisions.mjs";
+
+assert.equal(canAutoRevise({ draftOrigin: "ai", status: "review", exportedAt: null }), true);
+assert.equal(canAutoRevise({ draftOrigin: "ai", status: "review", revisionId: "new" }, "old"), false, "stale auto work cannot replace a newer version");
+assert.equal(canAutoRevise({ status: "review" }), false, "old drafts have unknown provenance");
+assert.equal(canAutoRevise({ draftOrigin: "reader", status: "review" }), false);
+assert.equal(canAutoRevise({ draftOrigin: "ai", status: "review", exportedAt: "2026-09-24T00:00:00Z" }), false);
+assert.equal(canAutoRevise({ draftOrigin: "ai", status: "approved" }), false);
+const aiDraft = { draftOrigin: "ai", status: "review", exportedAt: null };
+const good = { verdict: "conflicted", confidence: "high", suggestedChinese: "壱州会", sources: [{ url: "https://one.example/a", excerpt: "资料一" }, { url: "https://two.example/b", excerpt: "资料二" }] };
+assert.equal(canAutoReviseFromEvidence(aiDraft, good), true);
+assert.equal(canAutoReviseFromEvidence(aiDraft, { ...good, sources: [{ url: "https://one.example/a" }, { url: "https://one.example/b" }] }), false, "same-origin copies are not independent evidence");
+assert.equal(canAutoReviseFromEvidence(aiDraft, { ...good, verdict: "insufficient" }), false);
+assert.equal(canAutoReviseFromEvidence({ ...aiDraft, draftOrigin: "reader" }, good), false);
+const reextracted = preserveChapterRevisionState({ id: "one", title: "第一章", sourcePath: "new-source.txt" }, { id: "one", title: "旧标题", draftOrigin: "reader", revisionId: "r1", revisionHistory: [{ id: "r1", path: "old.md" }], exportedAt: "2026-09-24T00:00:00Z", quality: { unresolved: 1 } });
+assert.equal(reextracted.sourcePath, "new-source.txt");
+assert.equal(reextracted.draftOrigin, "reader");
+assert.equal(reextracted.revisionHistory.length, 1);
+assert.equal(reextracted.exportedAt, "2026-09-24T00:00:00Z");
+console.log("AI-only unexported revision eligibility checks passed");

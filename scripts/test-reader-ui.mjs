@@ -1,0 +1,41 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+
+const app = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+const page = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const css = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+
+assert.match(page, /rel="icon"[^>]*butterfly-peony-logo\.svg/, "the supplied logo is the favicon");
+assert.match(page, /class="brand-logo"/, "the brand rail shows the supplied logo");
+assert.match(css, /--blue:\s*#0D3B78/i, "the museum-inspired blue is a design token");
+assert.match(css, /prefers-reduced-motion/, "reduced motion is respected");
+assert.match(app, /继续阅读/, "library prioritizes a continuation action");
+assert.match(app, /book-index/, "the books are presented as an index");
+assert.match(app, /chapter-catalog/, "the chapter catalog has its own region");
+assert.match(css, /overflow-wrap:\s*anywhere/, "long titles wrap safely");
+assert.match(app, /正在运行/, "active tasks are named plainly");
+assert.match(app, /导出可阅读版/, "readable export remains primary");
+assert.match(app, /翻译 API/, "translation settings are distinct");
+assert.match(app, /联网搜索/, "search settings are distinct");
+assert.match(app, /settings-advanced/, "technical settings are progressively disclosed");
+assert.match(css, /@media\s*\(max-width:\s*1024px\)/, "the medium viewport has an explicit layout");
+assert.match(css, /@media\s*\(max-width:\s*760px\)/, "the narrow viewport has an explicit layout");
+assert.match(css, /:focus-visible/, "keyboard focus is visible");
+assert.match(css, /min-height:\s*44px/, "controls have comfortable targets");
+assert.match(page, /app\.js\?v=1\.8\.0/, "the release busts old browser assets");
+assert.match(app, /function confirmDiscardReaderEdit/, "navigation protects unsaved edits");
+assert.match(app, /保存翻译 API 失败/, "translation settings errors are inline");
+assert.match(app, /保存搜索设置失败/, "search settings errors are inline");
+assert.match(app, /手工写入译文/, "an untranslated chapter can still be edited manually");
+assert.match(app, /searchInput\.addEventListener\("input",[\s\S]*?confirmDiscardReaderEdit\(\)/, "search navigation protects unsaved edits");
+assert.match(app, /\[data-restore-revision\]"\)\.forEach\([^\n]+\{\s*if \(!confirmDiscardReaderEdit\(\)\)/, "version restore protects unsaved edits");
+
+assert.match(page, /阅读质量/, "reader quality has one main navigation entry");
+assert.match(app, /\/api\/search-settings/, "search settings have a separate API");
+assert.match(app, /测试搜索连接/, "reader can test the search connection");
+assert.match(app, /今日剩余/, "search budget is visible before use");
+assert.match(app, /查证此处/, "uncertain facts have a reader-facing verification action");
+assert.match(app, /查看原文（可选）/, "source text is optional and collapsed");
+assert.match(app, /查看依据与网页片段/, "evidence is available but not forced into the reading flow");
+assert.match(app, /你可以直接阅读/, "unapproved AI notes do not block reading");
+console.log("Reader-first interface entry and copy checks passed");

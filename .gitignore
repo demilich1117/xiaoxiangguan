@@ -1,0 +1,12 @@
+data/
+library/
+exports/
+secrets/
+logs/
+.server.pid
+work-test-runtime/
+work/
+scripts/__pycache__/
+.venv/
+node_modules/
+.env
