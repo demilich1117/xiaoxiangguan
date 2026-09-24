@@ -12,6 +12,7 @@ import { toolCandidates } from "../lib/tool-paths.mjs";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const book = { id: "test-book", title: "源氏物语（测试）", author: "紫式部", glossary: [{ japanese: "洛中", chinese: "洛中", definition: "此处指京都城内。" }], termCandidates: [{ japanese: "犬痴性", chinese: "犬痴性", note: "此处指某种旧时用语。", verification: "AI 建议，未联网核实" }], chapters: [{ id: "test-chapter", title: "第一帖　桐壶", status: "approved", source: "洛中の話。犬痴性。", translation: "不知是哪一代天皇在位之时。" }] };
 const outputPath = join(root, "exports", "_test.epub");
+await mkdir(dirname(outputPath), { recursive: true });
 const result = await createEpub({ book, chapters: book.chapters, outputPath, includeDraft: false });
 assert.equal(result.chapterCount, 1);
 assert.deepEqual(result.chapterIds, ["test-chapter"]);
