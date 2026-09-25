@@ -1,6 +1,6 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" -NoBrowser
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" -NoBrowser -ShowConsole
 if errorlevel 1 (
   echo.
   echo The translation library could not start. Please keep this window open.

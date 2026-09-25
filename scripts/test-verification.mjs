@@ -106,9 +106,12 @@ try {
   const mockProvider = http.createServer(async (req, res) => {
     let body = ""; for await (const chunk of req) body += chunk;
     if (body.includes("并发源文")) await new Promise((resolveWait) => setTimeout(resolveWait, 300));
-    const text = body.includes("术语、人名与疑难项") ? JSON.stringify({ terms, characters: [], uncertainties: [] }) : terms.map((item) => item.chinese).join("、");
+    let text = body.includes("术语、人名与疑难项") ? JSON.stringify({ terms, characters: [], uncertainties: [] }) : terms.map((item) => item.chinese).join("、");
+    const content = JSON.parse(body).messages?.[1]?.content || "";
+    const aligned = content.match(/原文段落：\n(\[[^\n]+\])/);
+    if (aligned) text = JSON.stringify({ segments: JSON.parse(aligned[1]).map((p) => ({ sourceParagraphIds: [p.id], text })) });
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ choices: [{ message: { content: text } }], usage: { prompt_tokens: 20, completion_tokens: 20 } }));
+    res.end(JSON.stringify({ choices: [{ message: { content: text }, finish_reason: "stop" }], usage: { prompt_tokens: 20, completion_tokens: 20 } }));
   });
   await new Promise((resolveListen) => mockProvider.listen(0, "127.0.0.1", resolveListen));
   try {

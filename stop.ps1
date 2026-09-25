@@ -23,7 +23,16 @@ if ($process) {
     if ($process.ProcessName -notmatch '^node') {
         throw "Process $serverPid is not Node. Nothing was stopped."
     }
-    try { Stop-Process -Id $serverPid -Force -ErrorAction Stop }
+    $gracefulRequested = $false
+    try {
+        $health = Invoke-RestMethod -Uri "http://127.0.0.1:4327/api/health" -TimeoutSec 2
+        if ($health.shutdown -and $health.pid -eq $serverPid) {
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:4327/api/shutdown" -Method Post -ContentType "application/json" -Body '{"confirm":true}' -TimeoutSec 12
+            $gracefulRequested = $true
+        }
+    } catch { Write-Host "Graceful shutdown is unavailable; stopping the recorded process." }
+    if ($gracefulRequested) { Wait-Process -Id $serverPid -Timeout 10 -ErrorAction SilentlyContinue }
+    try { if (Get-Process -Id $serverPid -ErrorAction SilentlyContinue) { Stop-Process -Id $serverPid -Force -ErrorAction Stop } }
     catch {
         if (Get-Process -Id $serverPid -ErrorAction SilentlyContinue) {
             throw "Unable to stop the translation library process ($serverPid). Please run this launcher directly from Windows Explorer."

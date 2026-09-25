@@ -1,8 +1,12 @@
+import { initThemes } from "./themes.js";
+import { mountReader, readingState, rememberReading } from "./reader.js";
 import { SOURCE_LANGUAGES, languageDetails, sourceLanguage } from "./languages.js";
 import { searchStatus, summarizeLibraryQuality } from "./reader-quality.js";
 import { readerMode } from "./reader-mode.js";
 import { pageBooks } from "./library-index.js";
 import { cleanReaderExplanation } from "./reader-notes.js";
+
+initThemes();
 
 const content = document.querySelector("#content");
 const pageTitle = document.querySelector("#page-title");
@@ -16,6 +20,18 @@ let selectedChapter = null;
 let providerSettings = null;
 let searchSettings = null;
 let taskPollTimer = null;
+let reader = null;
+let readerPollTimer = null;
+let navigationId = 0;
+function leaveReader() { reader?.destroy(); reader = null; clearTimeout(readerPollTimer); navigationId++; document.body.classList.remove("is-reading"); }
+function route(path) { if (location.hash !== `#${path}`) history.pushState(null, "", `#${path}`); }
+async function restoreRoute() {
+  const parts = location.hash.slice(1).split("/").filter(Boolean).map(decodeURIComponent);
+  if (parts[0] === "books" && parts[1]) { await load(); if (parts[2] === "chapters" && parts[3]) return renderWorkspace(parts[1], parts[3]); return renderBook(parts[1]); }
+  switchView(parts[0] || "library");
+}
+window.addEventListener("popstate", () => { if (confirmDiscardReaderEdit()) restoreRoute(); });
+window.addEventListener("beforeunload", (event) => { const editor = document.querySelector("#translation"); if (editor && !editor.hidden && editor.value !== String(selectedChapter?.translation || "")) { event.preventDefault(); event.returnValue = ""; } });
 const bookUiState = new Map();
 let glossaryBookFilter = "";
 let glossaryCategoryFilter = "";
@@ -42,7 +58,7 @@ function matchingProviderPreset(settings) {
 const labels = {
   not_started: "未开始", extracting: "提取中", extracted: "已提取", translating: "翻译中",
   drafted: "已初译", review: "待校订", approved: "已批准", failed: "失败",
-  completed: "已完成", paused: "已暂停", running: "运行中", cancelled: "已取消"
+  queued: "排队中", completed: "已完成", paused: "已暂停", running: "运行中", cancelled: "已取消"
   , suggested: "待确认", open: "待处理", resolved: "已解决"
 };
 
@@ -56,6 +72,30 @@ async function request(url, options = {}) {
 function notify(message) {
   toast.textContent = message; toast.classList.add("show");
   setTimeout(() => toast.classList.remove("show"), 2600);
+}
+
+async function shutdownWorkbench() {
+  if (reader?.isEditing()) return notify("请先保存或取消正在编辑的译文，再关闭后台");
+  if (document.querySelector("#shutdown-dialog")) return;
+  const dialog = document.createElement("dialog"); dialog.id = "shutdown-dialog"; dialog.className = "shutdown-dialog";
+  dialog.innerHTML = `<div class="dialog-head"><h2>关闭瀟湘館后台</h2><button id="dismiss-shutdown" aria-label="取消关闭">×</button></div><p id="shutdown-description">正在检查任务…</p><p>关闭浏览器页面时后台会继续运行；关闭后台后，再次双击启动程序即可回来。</p><p id="shutdown-error" role="alert"></p><div class="dialog-actions"><button id="keep-running">继续运行</button><button id="confirm-shutdown" class="primary" disabled>关闭后台</button></div>`;
+  document.body.append(dialog); dialog.showModal();
+  const close = () => { dialog.close(); dialog.remove(); };
+  dialog.querySelector("#dismiss-shutdown").onclick = close; dialog.querySelector("#keep-running").onclick = close; dialog.oncancel = close;
+  try {
+    const state = await request("/api/lifecycle"); if (!dialog.isConnected) return;
+    dialog.querySelector("#shutdown-description").textContent = state.activeTasks ? `有 ${state.activeTasks} 个任务尚未结束。关闭会停止这些任务并保留已完成的翻译块，下次可继续。` : "没有正在运行的任务，书籍与已保存内容会保留。";
+    dialog.querySelector("#confirm-shutdown").disabled = false;
+  } catch { dialog.querySelector("#shutdown-error").textContent = "当前后台尚不支持页面关闭。请先用 stop 停止，再启动更新后的工作台。"; }
+  dialog.querySelector("#confirm-shutdown").onclick = async () => {
+    const button = dialog.querySelector("#confirm-shutdown"); button.disabled = true; button.textContent = "正在保存并关闭…";
+    try {
+      await request("/api/shutdown", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: true }) });
+      clearTimeout(taskPollTimer); leaveReader(); currentView = "closed"; close();
+      document.body.classList.add("server-closed");
+      content.innerHTML = '<div class="empty"><strong>后台已关闭</strong><p>书籍与已完成进度已保存，可以关闭此页面。下次双击启动程序即可继续。</p></div>';
+    } catch (error) { button.disabled = false; button.textContent = "关闭后台"; dialog.querySelector("#shutdown-error").textContent = `未能确认后台退出：${error.message}`; }
+  };
 }
 
 function openImportDialog() {
@@ -98,6 +138,7 @@ function friendlyTaskError(task) {
 function setHeader(kicker, title) { eyebrow.textContent = kicker; pageTitle.textContent = title; }
 
 function renderLibrary() {
+  leaveReader(); currentView = "library"; route("/library"); searchInput.disabled = false;
   setHeader("藏书 / LIBRARY", "有鳳來儀");
   if (!data.books.length) {
     content.innerHTML = `<section class="welcome panel panel-pad"><div class="welcome-copy"><p class="eyebrow">WELCOME / 开始使用</p><h2>从一本书开始</h2><p>文件、译文、进度和 API 配置都只保存在这台电脑。先配置翻译 API，再导入 PDF、EPUB 或无 DRM 的 AZW3；联网搜索是可选的。</p><div class="welcome-actions"><button class="primary" id="welcome-import">导入第一本书</button><button id="welcome-settings">配置翻译 API</button></div></div><ol class="welcome-steps"><li><span>一</span><div><strong>配置翻译 API</strong><small>填写所选服务商的 API Key；Luna 是默认模型。</small></div></li><li><span>二</span><div><strong>导入并识别</strong><small>保留章节、页码和来源位置。</small></div></li><li><span>三</span><div><strong>选择范围</strong><small>按卷册、章节、PDF 页码或段落翻译。</small></div></li><li><span>四</span><div><strong>阅读与导出</strong><small>直接生成可导入 Apple Books 的 EPUB，无需审校原文。</small></div></li></ol></section>`;
@@ -111,17 +152,11 @@ function renderLibrary() {
   indexPage = Math.min(indexPage, pageCount - 1);
   const totalChapters = data.books.reduce((sum, book) => sum + book.chapters.length, 0);
   const approved = data.books.flatMap((book) => book.chapters).filter((chapter) => chapter.status === "approved").length;
-  const activeTasks = data.books.flatMap((book) => book.tasks || []).filter((task) => ["running", "paused"].includes(task.status)).length;
-  const recent = [...data.books].filter((book) => book.chapters.some((chapter) => ["drafted", "review", "approved"].includes(chapter.status))).sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))[0];
-  const recentChapter = recent?.chapters.findLast((chapter) => ["drafted", "review", "approved"].includes(chapter.status));
+  const activeTasks = data.books.flatMap((book) => book.tasks || []).filter((task) => ["queued", "running", "paused"].includes(task.status)).length;
+  const recent = [...data.books].sort((a, b) => (readingState(b.id).openedAt || 0) - (readingState(a.id).openedAt || 0))[0];
+  const recentChapter = recent?.chapters.find((c) => c.id === readingState(recent.id).chapterId) || recent?.chapters.find((c) => !c.id.endsWith("-pending"));
   content.innerHTML = `
-    <section class="continue-reading" aria-label="继续阅读"><div><p class="eyebrow">READING / 继续阅读</p><h2>${recent ? escapeHtml(recent.title) : "从一本书开始"}</h2><p>${recentChapter ? `最近处理的章节：${escapeHtml(recentChapter.title)}` : "导入书籍并翻译章节后，下一次可从这里继续。"}</p></div><button class="primary" id="continue-action">${recentChapter ? "继续阅读" : "导入第一本书"}</button></section>
-    <div class="stats">
-      <div class="stat"><small>书库作品</small><strong>${data.books.length}</strong><span>全部保存在本机</span></div>
-      <div class="stat"><small>章节总数</small><strong>${totalChapters}</strong><span>包括待提取章节</span></div>
-      <div class="stat"><small>已批准章节</small><strong>${approved}</strong><span>可进入正式 EPUB</span></div>
-      <div class="stat"><small>活动任务</small><strong>${activeTasks}</strong><span>运行或暂停</span></div>
-    </div>
+    <section class="continue-reading" aria-label="继续阅读"><div><p class="eyebrow">READING / 继续阅读</p><h2>${recent ? escapeHtml(recent.title) : "我的书库"}</h2><p>${recentChapter ? `阅读位置：${escapeHtml(recentChapter.title)}` : "章节正在整理，你可以先查看目录。"}</p></div><button class="primary" id="continue-action">${recentChapter ? "继续阅读" : "打开目录"}</button></section>
     <div class="section-head index-heading"><div><p class="eyebrow">INDEX / 作品索引</p><h2>全部作品</h2><p>依导入次序 · 共 ${books.length} 本</p></div><span class="index-count">${String(indexPage + 1).padStart(2, "0")} / ${String(pageCount).padStart(2, "0")}</span></div>
     <div class="book-grid book-index">${pageBooks(books, indexPage).map((book) => {
       const info = progress(book); return `<article class="book-card" data-book="${book.id}" role="button" tabindex="0" aria-label="打开作品：${escapeAttribute(book.title)}">
@@ -132,7 +167,7 @@ function renderLibrary() {
       </article>`;
     }).join("") || '<div class="empty"><strong>没有匹配的作品</strong>请尝试其他搜索词，或清空搜索后浏览全部作品。<button id="clear-library-search">清空搜索</button></div>'}</div>
     ${pageCount > 1 ? `<nav class="index-pages" aria-label="作品索引分页"><button id="index-prev" ${indexPage === 0 ? "disabled" : ""}>上一页</button><span>第 ${indexPage + 1} / ${pageCount} 页</span><button id="index-next" ${indexPage === pageCount - 1 ? "disabled" : ""}>下一页</button></nav>` : ""}`;
-  document.querySelector("#continue-action").onclick = () => recentChapter ? renderWorkspace(recent.id, recentChapter.id) : openImportDialog();
+  document.querySelector("#continue-action").onclick = () => recentChapter ? renderWorkspace(recent.id, recentChapter.id) : renderBook(recent.id);
   const clearSearch = document.querySelector("#clear-library-search"); if (clearSearch) clearSearch.onclick = () => { searchInput.value = ""; renderLibrary(); };
   const previousPage = document.querySelector("#index-prev"); if (previousPage) previousPage.onclick = () => { indexPage--; renderLibrary(); };
   const nextPage = document.querySelector("#index-next"); if (nextPage) nextPage.onclick = () => { indexPage++; renderLibrary(); };
@@ -153,6 +188,7 @@ function getBookUiState(book, works) {
 }
 
 function renderBook(bookId) {
+  leaveReader(); currentView = "book"; route(`/books/${encodeURIComponent(bookId)}`); searchInput.disabled = true;
   const book = data.books.find((item) => item.id === bookId); if (!book) return;
   selectedBook = book; const info = progress(book); const works = bookWorks(book); const state = getBookUiState(book, works); setHeader(book.format, book.title);
   const activeWork = works.find((work) => work.id === state.workId) || works[0]; const activeIds = new Set(activeWork?.chapterIds || []);
@@ -171,16 +207,16 @@ function renderBook(bookId) {
       <div class="tags"><span class="tag">${works.length} 部作品</span><span class="tag">${info.total} 个正文单元</span><span class="tag">${info.approved} 个已批准</span>${book.demo ? '<span class="tag">演示数据</span>' : ""}</div></div>
       <div class="hero-actions"><button id="edit-book">编辑资料</button><button class="danger-quiet" id="delete-book">删除作品</button><button data-nav="glossary">阅读质量</button>${needsExtraction ? '<button class="primary" id="extract-book">识别章节</button>' : '<button id="extract-book">重新整理目录</button><button class="primary" id="quick-export">导出可阅读 EPUB</button>'}</div></div>
     <div class="catalog-layout">
-      <aside class="panel panel-pad work-browser"><p class="eyebrow">COLLECTION</p><h2>作品目录</h2><p>先选择小说，再处理其中的章节。</p><label>当前作品<select id="work-select">${works.map((work) => `<option value="${work.id}" ${work.id === activeWork?.id ? "selected" : ""}>${escapeHtml(work.title)}（${work.chapterIds.length}）</option>`).join("")}</select></label><div class="work-summary"><strong>${escapeHtml(activeWork?.title || book.title)}</strong><span>${visibleChapters.length} 个正文单元</span></div><small>标题页、目录页和无正文的结构节点已隐藏，不会进入翻译队列。</small></aside>
-      <section class="panel panel-pad selection-panel"><div class="section-head compact"><div><p class="eyebrow">SELECTION</p><h2>已选择章节</h2><p>勾选结果会保留；切换作品后也可以继续追加。</p></div><div class="scope-count"><strong id="scope-count">${state.selectedIds.size}</strong><span>章已选</span></div></div><div class="selected-chapters" id="selected-chapters"></div><label class="scope-name-label">给这组选中的章节命名<input id="scope-name" placeholder="例如：上杉谦信·第一卷"/></label><small>“选集名称”是你为这组章节取的名称；下方会同时列出真正选中的章节。</small><div class="scope-actions"><button id="clear-selection">清空选择</button><button id="save-scope">保存到“我的选集”</button><span class="spacer"></span><button id="export-selected">导出所选（含草稿）</button><button class="primary" id="translate-selected">翻译所选章节</button></div></section>
+      <aside class="panel panel-pad work-browser" ${works.length === 1 ? "hidden" : ""}><p class="eyebrow">COLLECTION</p><h2>作品目录</h2><p>先选择小说，再处理其中的章节。</p><label>当前作品<select id="work-select">${works.map((work) => `<option value="${work.id}" ${work.id === activeWork?.id ? "selected" : ""}>${escapeHtml(work.title)}（${work.chapterIds.length}）</option>`).join("")}</select></label><div class="work-summary"><strong>${escapeHtml(activeWork?.title || book.title)}</strong><span>${visibleChapters.length} 个正文单元</span></div><small>标题页、目录页和无正文的结构节点已隐藏，不会进入翻译队列。</small></aside>
+      <section class="panel panel-pad selection-panel"><div class="section-head compact"><div><p class="eyebrow">SELECTION</p><h2>已选择章节</h2><p>勾选结果会保留；切换作品后也可以继续追加。</p></div><div class="scope-count"><strong id="scope-count">${state.selectedIds.size}</strong><span>章已选</span></div></div><div class="selected-chapters" id="selected-chapters"></div><details class="scope-more"><summary>保存为选集</summary><label class="scope-name-label">给这组选中的章节命名<input id="scope-name" placeholder="例如：上杉谦信·第一卷"/></label><small>“选集名称”是你为这组章节取的名称；下方会同时列出真正选中的章节。</small><button id="save-scope">保存到“我的选集”</button></details><div class="scope-actions"><button id="clear-selection">清空选择</button><span class="spacer"></span><button id="export-selected">导出所选（含草稿）</button><button class="primary" id="translate-selected">翻译所选章节</button></div></section>
     </div>
-    <section class="panel panel-pad saved-section"><div class="section-head compact"><div><p class="eyebrow">MY SETS</p><h2>我的选集</h2><p>保存后会固定显示在这里，可重新打开、继续选章或删除。</p></div></div>${manualScopes.length ? `<div class="saved-scope-grid">${manualScopes.map((scope) => `<article class="saved-scope-item"><div><strong>${escapeHtml(scope.name)}</strong><span>${scope.chapterIds.length} 个章节</span></div><div><button data-open-scope="${scope.id}">打开</button><button class="danger-quiet" data-delete-scope="${scope.id}">删除</button></div></article>`).join("")}</div>` : '<div class="empty slim">还没有保存的选集。先在下方勾选章节，再点击“保存到我的选集”。</div>'}</section>
+    <details class="panel panel-pad saved-section"><summary>我的选集与更多操作</summary><div class="section-head compact"><div><p class="eyebrow">MY SETS</p><h2>我的选集</h2><p>保存后会固定显示在这里，可重新打开、继续选章或删除。</p></div></div>${manualScopes.length ? `<div class="saved-scope-grid">${manualScopes.map((scope) => `<article class="saved-scope-item"><div><strong>${escapeHtml(scope.name)}</strong><span>${scope.chapterIds.length} 个章节</span></div><div><button data-open-scope="${scope.id}">打开</button><button class="danger-quiet" data-delete-scope="${scope.id}">删除</button></div></article>`).join("")}</div>` : '<div class="empty slim">还没有保存的选集。先在下方勾选章节，再点击“保存到我的选集”。</div>'}</details>
     <div class="section-head"><div><h2>${escapeHtml(activeWork?.title || "章节进度")}</h2><p>当前显示这部作品中的 ${visibleChapters.length} 个正文单元</p></div><span>${info.percent}% 已批准</span></div>
     <div class="panel chapter-catalog"><table class="table chapter-table"><thead><tr><th class="check-cell"><input id="select-all-chapters" type="checkbox" aria-label="选择当前作品全部章节"/></th><th>章节</th><th>源位置</th><th>段落</th><th>状态</th><th></th></tr></thead><tbody>
     ${chapterRows || '<tr><td colspan="6" class="empty">这部作品没有可翻译的正文单元。</td></tr>'}
     </tbody></table></div>`;
   document.querySelector("#back-library").onclick = renderLibrary;
-  const exportButton = document.querySelector("#quick-export"); if (exportButton) exportButton.onclick = () => exportEpub(book.id, true);
+  const exportButton = document.querySelector("#quick-export"); if (exportButton) exportButton.disabled = !book.chapters.some((c) => c.translation || c.translationPath || c.polishedPath || c.activeRevisionId); if (exportButton) exportButton.onclick = () => exportEpub(book.id, true);
   const extractButton = document.querySelector("#extract-book"); if (extractButton) extractButton.onclick = () => extractBook(book.id);
   document.querySelector("#edit-book").onclick = () => openEditBook(book);
   document.querySelector("#delete-book").onclick = () => deleteBook(book);
@@ -188,6 +224,7 @@ function renderBook(bookId) {
   content.querySelector("[data-nav='glossary']").onclick = () => switchView("glossary");
   const scopeName = document.querySelector("#scope-name"); const checks = [...content.querySelectorAll(".chapter-check")];
   const updateSelection = () => {
+    document.querySelector(".selection-panel").hidden = !state.selectedIds.size;
     document.querySelector("#scope-count").textContent = state.selectedIds.size;
     const selected = book.chapters.filter((chapter) => state.selectedIds.has(chapter.id));
     document.querySelector("#selected-chapters").innerHTML = selected.length ? selected.slice(0, 12).map((chapter) => `<span>${escapeHtml(chapter.workTitle && chapter.workTitle !== activeWork?.title ? `${chapter.workTitle} · ${chapter.title}` : chapter.title)}</span>`).join("") + (selected.length > 12 ? `<em>另有 ${selected.length - 12} 章</em>` : "") : '<small>尚未选择章节</small>';
@@ -206,6 +243,10 @@ function renderBook(bookId) {
   document.querySelector("#translate-selected").onclick = () => translateSelected(book, [...state.selectedIds]);
   document.querySelector("#export-selected").onclick = () => exportEpub(book.id, true, [...state.selectedIds]);
   updateSelection();
+  const catalog = content.querySelector(".chapter-catalog"); const layout = content.querySelector(".catalog-layout");
+  layout.before(catalog.previousElementSibling, catalog); // Chapters precede optional selection tools.
+  const saved = content.querySelector(".saved-section"); if (saved) saved.open = false;
+  if (needsExtraction) { clearTimeout(taskPollTimer); taskPollTimer = setTimeout(async () => { await load(); if (currentView === "book" && selectedBook?.id === bookId) renderBook(bookId); }, 1800); }
 }
 
 function openEditBook(book) {
@@ -223,66 +264,51 @@ async function deleteBook(book) {
   try { await request(`/api/books/${book.id}`, { method: "DELETE" }); await load(); renderLibrary(); notify("作品已从书库删除，项目数据已移入 .trash"); } catch (error) { notify(error.message); }
 }
 
-async function renderWorkspace(bookId, chapterId) {
+async function renderWorkspace(bookId, chapterId, anchor) {
   if (!confirmDiscardReaderEdit()) return;
-  const book = data.books.find((item) => item.id === bookId); const chapterSummary = book?.chapters.find((item) => item.id === chapterId); if (!chapterSummary) return;
-  selectedBook = book; setHeader(book.title, chapterSummary.title); content.innerHTML = '<div class="empty"><strong>正在读取章节…</strong></div>';
-  let chapter; try { chapter = await request(`/api/books/${bookId}/chapters/${chapterId}`); } catch (error) { content.innerHTML = `<div class="empty"><strong>章节读取失败</strong>${escapeHtml(error.message)}</div>`; return; }
-  selectedChapter = chapter; const usage = chapter.usage || {}; const pageNumbers = [...chapter.source.matchAll(/\[\[PDF_PAGE_(\d+)\]\]/g)].map((match) => Number(match[1]));
-  const matchedTerms = [...(book.glossary || []), ...(book.termCandidates || [])].filter((item) => item.japanese && chapter.source.includes(item.japanese));
-  const matchedPeople = [...(book.characters || []), ...(book.characterCandidates || [])].filter((item) => (item.japanese || item.japaneseName) && chapter.source.includes(item.japanese || item.japaneseName));
-  const pendingCount = (book.termCandidates || []).filter((item) => item.chapterId === chapter.id).length + (book.characterCandidates || []).filter((item) => item.chapterId === chapter.id).length;
-  const initialMode = readerMode({ hasTranslation: Boolean(chapter.translation), editing: false });
-  content.innerHTML = `<div class="workspace-toolbar"><button id="back-book">← 章节列表</button><span>${status(chapter.status)}</span><span class="tag">${escapeHtml(chapter.sourceLocator || "待识别")}</span><span class="spacer"></span><details class="workspace-advanced"><summary>更多操作</summary><button id="analyze-chapter">重新分析译名</button>${chapter.translation ? '<button id="refine-translation">精校本章</button>' : ""}<button id="approve">标记已读定稿</button></details></div>
-    <div class="workspace"><section class="editor-pane reader-pane" data-reader-mode="${initialMode}"><div class="pane-head"><strong>中文译文</strong><div class="reader-actions"><span>${chapter.translation ? "可选中、复制的中文正文" : "尚无译文 · 选择右侧范围开始翻译"}</span><button id="edit-translation">${chapter.translation ? "编辑译文" : "手工写入译文"}</button><button id="cancel-edit" hidden>取消编辑</button><button class="primary" id="save-draft" hidden>保存修改</button></div></div><div class="translation-read" id="translation-read" ${chapter.translation ? "" : "hidden"}>${escapeHtml(chapter.translation || "")}</div><div class="translation-empty" ${chapter.translation ? "hidden" : ""}><strong>这一章还没有中文译文</strong><p>在“翻译范围”中选择整章、段落或页码，然后点击“翻译此范围”。</p></div><textarea class="translation-editor" id="translation" aria-label="编辑中文译文" placeholder="尚无译文" hidden>${escapeHtml(chapter.translation || "")}</textarea><details class="source-details"><summary>查看原文（可选）</summary><div class="pane-body source-text">${escapeHtml(chapter.source || "尚未提取原文")}</div></details></section>
-      <aside class="context-pane"><section class="range-picker"><p class="eyebrow">RANGE</p><h3>翻译范围</h3><label>范围<select id="range-type"><option value="whole">整章</option><option value="paragraphs">段落范围</option>${book.format === "PDF" ? '<option value="pages">PDF 页码</option>' : ""}</select></label><div class="range-fields" id="range-fields"><label>起始<input id="range-start" type="number" min="1" value="1"/></label><label>结束<input id="range-end" type="number" min="1" value="${chapter.paragraphCount || 1}"/></label></div><small id="range-hint">整章翻译会更新主译文</small><button class="primary wide" id="translate-range">翻译此范围</button></section><section><h3>本章信息</h3><div class="term"><strong>${chapter.paragraphCount || 0} 个段落</strong><small>${pageNumbers.length ? `PDF 第 ${Math.min(...pageNumbers)}–${Math.max(...pageNumbers)} 页` : escapeHtml(chapter.sourceLocator || "暂无定位")}</small></div></section>
-      <section><h3>API 用量</h3><div class="term"><strong>${usage.inputTokens || 0} 输入 / ${usage.outputTokens || 0} 输出</strong><small>估算费用 ${Number(usage.estimatedCost || 0).toFixed(4)} · ${escapeHtml(chapter.lastModel || "尚未调用")}</small></div></section>
-      <section><h3>阅读质量</h3><div class="term"><strong>${(chapter.quality?.autoChecks || []).filter((item) => item.autoRevised).length} 处自动修正 · ${chapter.quality?.unresolved || 0} 处仍待核实</strong><small>资料不足时继续阅读，不要求你审核原文。</small></div>${(chapter.quality?.autoChecks || []).map((item) => `<details class="term"><summary>${escapeHtml(item.originalTerm)} · ${item.verdict === "supported" ? "资料支持" : item.verdict === "conflicted" ? "资料冲突" : item.verdict === "unavailable" ? "搜索不可用" : "证据不足"}</summary><small>${escapeHtml(item.reason || "")}</small>${(item.sources || []).map((source) => `<small><a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(source.title || source.url)}</a> · ${escapeHtml(source.excerpt || "")}</small>`).join("")}</details>`).join("")}${(chapter.revisionHistory || []).length > 1 ? `<details class="term"><summary>查看译稿历史（${chapter.revisionHistory.length} 版）</summary>${chapter.revisionHistory.map((revision) => `<button data-restore-revision="${escapeHtml(revision.id)}">恢复 ${formatDate(revision.createdAt)} · ${escapeHtml(revision.reason || revision.origin)}</button>`).join("")}</details>` : ""}</section>
-      <section><h3>译名与读者注释</h3><p class="notes-disclaimer">AI 初译释义可能未经联网核实；有资料支持的条目会单独标明。</p>${chapter.analysis ? `<div class="term"><strong>已分析 ${chapter.analysis.analyzedCharacters || 0}/${chapter.analysis.sourceCharacters || 0} 字</strong><small>${escapeHtml(chapter.analysis.model || "")} · ${formatDate(chapter.analysis.analyzedAt)}</small></div>` : '<div class="term"><strong>尚无 AI 注释</strong><small>翻译整章时会自动生成。</small></div>'}${[...matchedTerms.map((item) => ({ ja: item.japanese, zh: item.chinese, meta: cleanReaderExplanation(item.definition || item.research?.definition || item.note || item.notes || ""), verified: item.research?.verdict === "supported" })), ...matchedPeople.map((item) => ({ ja: item.japanese || item.japaneseName, zh: item.chinese || item.chineseName, meta: cleanReaderExplanation(item.definition || item.research?.definition || item.identity || ""), verified: item.research?.verdict === "supported" }))].filter((item) => item.meta).slice(0, 8).map((item) => `<div class="term"><strong>${escapeHtml(item.ja)} → ${escapeHtml(item.zh)}</strong><small>${escapeHtml(item.meta || "")}${item.verified ? " · 资料支持" : ""}</small></div>`).join("") || '<small>本章暂无译名注释</small>'}${pendingCount ? `<button class="wide" id="review-candidates">查看全部译名注释</button>` : ""}</section>
-      <section><h3>疑难项</h3>${(book.uncertainties || []).filter((item) => item.chapter === chapter.title).map((item) => `<div class="term"><strong>${escapeHtml(item.text)}</strong><small>${escapeHtml(item.note)}</small></div>`).join("") || "本章暂无未决项"}</section></aside></div>
-    <section class="selection-results"><div class="section-head"><div><h2>节选译文</h2><p>页码或段落翻译独立保存，不会覆盖本章主译文。</p></div><button id="export-selections">导出本书全部已批准节选</button></div>${(chapter.segments || []).map((segment) => `<article class="segment-card panel panel-pad"><div class="segment-head"><div><span class="tag">${escapeHtml(segment.label)}</span><strong>${formatDate(segment.createdAt)}</strong></div>${status(segment.status)}</div><details><summary>查看原文</summary><div class="segment-source">${escapeHtml(segment.source)}</div></details><textarea data-segment-text="${segment.id}">${escapeHtml(segment.translation || "")}</textarea><div class="dialog-actions"><button data-segment-save="${segment.id}">保存节选</button><button class="primary" data-segment-approve="${segment.id}">批准节选</button></div></article>`).join("") || '<div class="empty slim">尚无节选译文。选择页码或段落后开始翻译。</div>'}</section>`;
-  document.querySelector("#back-book").onclick = () => { if (confirmDiscardReaderEdit()) renderBook(book.id); };
-  const editor = document.querySelector("#translation");
-  const readBlock = document.querySelector("#translation-read");
-  const editButton = document.querySelector("#edit-translation");
-  const cancelButton = document.querySelector("#cancel-edit");
-  if (editButton) editButton.onclick = () => { editor.hidden = false; readBlock.hidden = true; content.querySelector(".translation-empty").hidden = true; editButton.hidden = true; cancelButton.hidden = false; document.querySelector("#save-draft").hidden = false; content.querySelector(".reader-pane").dataset.readerMode = "edit"; editor.focus(); };
-  if (cancelButton) cancelButton.onclick = () => { if (editor.value !== String(chapter.translation || "") && !confirm("放弃尚未保存的译文修改？")) return; editor.value = chapter.translation || ""; editor.hidden = true; readBlock.hidden = !chapter.translation; content.querySelector(".translation-empty").hidden = Boolean(chapter.translation); editButton.hidden = false; cancelButton.hidden = true; document.querySelector("#save-draft").hidden = true; content.querySelector(".reader-pane").dataset.readerMode = readerMode({ hasTranslation: Boolean(chapter.translation), editing: false }); };
-  document.querySelector("#save-draft").onclick = () => saveChapter(book, chapter, "review");
-  document.querySelector("#approve").onclick = () => saveChapter(book, chapter, "approved");
-  document.querySelector("#analyze-chapter").onclick = () => startChapterAnalysis(book, chapter);
-  const reviewCandidates = document.querySelector("#review-candidates"); if (reviewCandidates) reviewCandidates.onclick = () => switchView("glossary");
-  content.querySelectorAll("[data-restore-revision]").forEach((button) => button.onclick = async () => {
-    if (!confirmDiscardReaderEdit()) return;
-    if (!confirm("恢复这个历史版本？当前版本会留在历史记录中，可再次恢复。")) return;
-    try { await request(`/api/books/${book.id}/chapters/${chapter.id}/revisions/${button.dataset.restoreRevision}/restore`, { method: "POST" }); await load(); renderWorkspace(book.id, chapter.id); notify("已恢复历史译稿"); }
-    catch (error) { notify(error.message); }
-  });
-  const rangeType = document.querySelector("#range-type"); const updateRange = () => { const isWhole = rangeType.value === "whole"; document.querySelector("#range-fields").classList.toggle("hidden", isWhole); document.querySelector("#range-hint").textContent = isWhole ? "整章翻译会更新主译文" : "节选会单独保存，不覆盖主译文"; if (rangeType.value === "pages" && pageNumbers.length) { document.querySelector("#range-start").value = Math.min(...pageNumbers); document.querySelector("#range-end").value = Math.max(...pageNumbers); } else if (rangeType.value === "paragraphs") { document.querySelector("#range-start").value = 1; document.querySelector("#range-end").value = chapter.paragraphCount || 1; } }; rangeType.onchange = updateRange; updateRange();
-  document.querySelector("#translate-range").onclick = () => { const type = rangeType.value; const range = type === "whole" ? { type } : { type, start: Number(document.querySelector("#range-start").value), end: Number(document.querySelector("#range-end").value) }; startTranslation(book, chapter, "draft", range); };
-  content.querySelectorAll("[data-segment-save]").forEach((button) => button.onclick = () => saveSegment(book, chapter, button.dataset.segmentSave, "review"));
-  content.querySelectorAll("[data-segment-approve]").forEach((button) => button.onclick = () => saveSegment(book, chapter, button.dataset.segmentApprove, "approved"));
-  document.querySelector("#export-selections").onclick = () => exportEpub(book.id, false, [], true);
-  const refine = document.querySelector("#refine-translation"); if (refine) refine.onclick = () => startTranslation(book, chapter, "refine");
+  leaveReader(); currentView = "reader"; selectedBook = data.books.find((b) => b.id === bookId);
+  if (!selectedBook) return renderLibrary();
+  if (anchor) rememberReading(bookId, { chapterId, anchor });
+  route(`/books/${encodeURIComponent(bookId)}/chapters/${encodeURIComponent(chapterId)}`);
+  const token = navigationId;
+  try {
+    const chapter = await request(`/api/books/${bookId}/chapters/${chapterId}`);
+    if (token !== navigationId) return;
+    selectedChapter = chapter; document.body.classList.add("is-reading");
+    const book = selectedBook;
+    reader = mountReader({ container: content, book, chapter, request, notify,
+      navigate: (id, target) => renderWorkspace(bookId, id, target), back: () => { if (confirmDiscardReaderEdit()) renderBook(bookId); }, configure: () => switchView("settings"),
+      start: (mode, range, retry) => startTranslation(book, selectedChapter, mode, range, retry),
+      save: async (translation, status) => { try { const payload = { status }; if (translation !== undefined) payload.translation = translation; const updated = await request(`/api/books/${bookId}/chapters/${chapterId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }); if (translation !== undefined) selectedChapter.translation = translation; reader?.update(await request(`/api/books/${bookId}/chapters/${chapterId}`)); notify("修改已保存"); return true; } catch (e) { notify(e.message); return false; } },
+      analyze: () => startChapterAnalysis(book, selectedChapter), exportBook: () => exportEpub(bookId, true, [chapterId]), onChapter: (value) => { selectedChapter = value; }, shutdown: shutdownWorkbench
+    });
+    const poll = async () => {
+      try { const [next, library] = await Promise.all([request(`/api/books/${bookId}/chapters/${chapterId}`), request("/api/library")]); if (token !== navigationId) return; data = library; const tasks = library.books.find((b) => b.id === bookId)?.tasks || []; const task = tasks.find((t) => t.chapterId === chapterId); reader?.update(next, task); }
+      catch (e) { if (token === navigationId) notify(e.message); }
+      if (token === navigationId) readerPollTimer = setTimeout(poll, 1200);
+    };
+    poll();
+  } catch (e) { notify(e.message); renderBook(bookId); }
 }
 
 async function startChapterAnalysis(book, chapter) {
-  if (!confirm(`分析“${chapter.title}”中的术语、人物和疑难项？本次操作会调用已配置的 API，结果先进入待确认区，不会直接改变固定译名。`)) return;
-  try { await request(`/api/books/${book.id}/chapters/${chapter.id}/analyze`, { method: "POST" }); await load(); switchView("tasks"); notify("分析任务已进入队列"); }
+  if (!confirm(`分析“${chapter.title}”中的术语、人物和疑难项？本次操作会调用已配置的翻译引擎，结果先进入待确认区，不会直接改变固定译名。`)) return;
+  try { await request(`/api/books/${book.id}/chapters/${chapter.id}/analyze`, { method: "POST" }); await load(); notify("分析任务已进入队列"); }
   catch (error) { notify(error.message); }
 }
 
 async function extractBook(bookId) {
-  try { await request(`/api/books/${bookId}/extract`, { method: "POST" }); notify("章节识别任务已开始"); await load(); switchView("tasks"); }
+  try { await request(`/api/books/${bookId}/extract`, { method: "POST" }); notify("章节识别任务已开始"); await load(); renderBook(bookId); }
   catch (error) { notify(error.message); }
 }
 
-async function startTranslation(book, chapter, mode, range = { type: "whole" }) {
-  const label = mode === "refine" ? "精校" : "初译";
-  const scopeText = range.type === "whole" ? "整章" : range.type === "pages" ? `PDF 第 ${range.start}–${range.end} 页` : `第 ${range.start}–${range.end} 段`;
-  if (!confirm(`${label}“${chapter.title}”的${scopeText}？本次操作会调用你配置的 API，并可能产生费用。`)) return;
-  try { await request(`/api/books/${book.id}/chapters/${chapter.id}/translate`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode, range }) }); notify(`${label}任务已进入队列`); await load(); switchView("tasks"); }
-  catch (error) { notify(error.message); }
+async function startTranslation(book, chapter, mode, range = { type: "whole" }, retry = false) {
+  try {
+    const settings = await request("/api/provider");
+    if ((!settings.backend || settings.backend === "http") && !(settings.baseUrl && settings.model && (settings.hasApiKey || settings.noAuth))) { notify("请先选择翻译引擎"); switchView("settings"); return; }
+    await request(`/api/books/${book.id}/chapters/${chapter.id}/translate`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode, range, retry }) });
+    notify(retry ? "已从未完成块继续" : "翻译已加入队列，可以继续阅读"); await load();
+  } catch (error) { notify(error.message); }
 }
 
 async function saveScope(book, chapterIds) {
@@ -299,7 +325,7 @@ async function deleteScope(book, scopeId) {
 async function translateSelected(book, chapterIds) {
   if (!chapterIds.length) return notify("请先选择至少一个章节");
   if (!confirm(`将 ${chapterIds.length} 个章节依次加入本地翻译队列？任务会逐章调用 API。`)) return;
-  try { for (const chapterId of chapterIds) await request(`/api/books/${book.id}/chapters/${chapterId}/translate`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "draft", range: { type: "whole" } }) }); await load(); switchView("tasks"); notify(`${chapterIds.length} 个章节已加入队列`); } catch (error) { notify(error.message); }
+  try { for (const chapterId of chapterIds) await request(`/api/books/${book.id}/chapters/${chapterId}/translate`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "draft", range: { type: "whole" } }) }); await load(); renderBook(book.id); notify(`${chapterIds.length} 个章节已加入队列`); } catch (error) { notify(error.message); }
 }
 
 async function saveSegment(book, chapter, segmentId, statusValue) {
@@ -320,15 +346,17 @@ async function saveChapter(book, chapter, statusValue) {
 
 function renderTasks() {
   setHeader("本地队列", "任务中心");
-  const rank = { running: 0, paused: 1, failed: 2, cancelled: 3, completed: 4 };
-  const tasks = data.books.flatMap((book) => (book.tasks || []).map((task) => ({ ...task, bookTitle: book.title, demo: book.demo }))).sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
-  const active = tasks.filter((task) => ["running", "paused"].includes(task.status)); const history = tasks.filter((task) => !["running", "paused"].includes(task.status));
-  const rows = (items, activeRows = false) => items.map((task) => `<div class="task-row ${activeRows ? "active-task" : ""}"><div><strong>${escapeHtml(task.type)}</strong><small class="subline">${escapeHtml(task.bookTitle)}</small></div><div><span>${escapeHtml(task.detail || task.type)}</span>${task.error ? `<small class="task-error">${escapeHtml(friendlyTaskError(task))}</small>` : ""}<div class="progress"><i style="width:${task.progress || 0}%"></i></div><small>${formatDate(task.updatedAt || task.createdAt)}</small></div><span>${status(task.status)}</span><div class="task-actions">${!task.demo && task.status === "running" ? `<button data-task-action="pause" data-task="${task.id}">暂停</button><button data-task-action="cancel" data-task="${task.id}">取消</button>` : !task.demo && task.status === "paused" ? `<button data-task-action="resume" data-task="${task.id}">继续</button><button data-task-action="cancel" data-task="${task.id}">取消</button>` : `<button data-task-delete="${task.id}">删除</button>`}</div></div>`).join("");
+  const rank = { queued: 0, running: 0, paused: 1, failed: 2, cancelled: 3, completed: 4 };
+  const tasks = data.books.flatMap((book) => (book.tasks || []).map((task) => ({ ...task, bookTitle: book.title, bookId: book.id, demo: book.demo }))).sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0));
+  const active = tasks.filter((task) => ["queued", "running", "paused"].includes(task.status)); const history = tasks.filter((task) => !["queued", "running", "paused"].includes(task.status));
+  const rows = (items, activeRows = false) => items.map((task) => `<div class="task-row ${activeRows ? "active-task" : ""}"><div><strong>${escapeHtml(task.type)}</strong><small class="subline">${escapeHtml(task.bookTitle)}</small></div><div><span>${escapeHtml(task.detail || task.type)}</span>${task.error ? `<small class="task-error">${escapeHtml(friendlyTaskError(task))}</small>` : ""}<div class="progress"><i style="width:${task.progress || 0}%"></i></div><small>${formatDate(task.updatedAt || task.createdAt)}</small></div><span>${status(task.status)}</span><div class="task-actions"><button data-task-open="${task.id}">打开成果</button>${["failed", "cancelled"].includes(task.status) && task.chapterId ? `<button data-task-retry="${task.id}">继续翻译</button>` : ""}${!task.demo && ["queued", "running"].includes(task.status) ? `<button data-task-action="pause" data-task="${task.id}">暂停</button><button data-task-action="cancel" data-task="${task.id}">取消</button>` : !task.demo && task.status === "paused" ? `<button data-task-action="resume" data-task="${task.id}">继续</button><button data-task-action="cancel" data-task="${task.id}">取消</button>` : `<button data-task-delete="${task.id}">删除</button>`}</div></div>`).join("");
   content.innerHTML = `<div class="section-head"><div><p class="eyebrow">NOW / 当前状态</p><h2>正在运行</h2></div><span>${active.length} 个</span></div><div class="panel active-task-list">${rows(active, true) || '<div class="empty slim">当前没有运行中的任务。可以继续阅读或选择章节开始翻译。</div>'}</div><div class="section-head"><div><p class="eyebrow">HISTORY / 最近记录</p><h2>历史任务</h2></div>${history.length ? '<button id="clear-finished-tasks">清理全部历史</button>' : ""}</div><div class="panel">${rows(history) || '<div class="empty slim">暂无历史任务</div>'}</div>`;
   content.querySelectorAll("[data-task-action]").forEach((button) => button.onclick = () => taskAction(button.dataset.task, button.dataset.taskAction));
   content.querySelectorAll("[data-task-delete]").forEach((button) => button.onclick = () => deleteTask(button.dataset.taskDelete));
+  content.querySelectorAll("[data-task-open]").forEach((button) => button.onclick = () => { const task = tasks.find((t) => t.id === button.dataset.taskOpen); task.chapterId ? renderWorkspace(task.bookId, task.chapterId) : renderBook(task.bookId); });
+  content.querySelectorAll("[data-task-retry]").forEach((button) => button.onclick = async () => { const task = tasks.find((t) => t.id === button.dataset.taskRetry); const book = data.books.find((b) => b.id === task.bookId); await startTranslation(book, book.chapters.find((c) => c.id === task.chapterId), task.mode, task.range, true); renderWorkspace(book.id, task.chapterId); });
   const clearFinished = document.querySelector("#clear-finished-tasks"); if (clearFinished) clearFinished.onclick = clearFinishedTasks;
-  if (tasks.some((task) => !task.demo && ["running", "paused"].includes(task.status))) taskPollTimer = setTimeout(async () => { await load(); if (currentView === "tasks") renderTasks(); }, 1500);
+  if (tasks.some((task) => !task.demo && ["queued", "running", "paused"].includes(task.status))) taskPollTimer = setTimeout(async () => { await load(); if (currentView === "tasks") renderTasks(); }, 1500);
 }
 
 async function taskAction(taskId, action) { try { await request(`/api/tasks/${taskId}/${action}`, { method: "POST" }); await load(); renderTasks(); } catch (error) { notify(error.message); } }
@@ -338,6 +366,7 @@ async function clearFinishedTasks() { if (!confirm("清理全部已完成、失�
 function renderGlossary() {
   setHeader("读者视角", "阅读质量");
   const quality = summarizeLibraryQuality(data.books);
+  const analyzedChapters = data.books.flatMap((b) => b.chapters).filter((c) => c.analysis).length;
   const concerns = data.books.flatMap((book) => (book.chapters || []).flatMap((chapter) => (chapter.quality?.autoChecks || []).filter((check) => check.verdict !== "supported").map((check) => ({ ...check, bookId: book.id, bookTitle: book.title, chapterId: chapter.id, chapterTitle: chapter.title })))).slice(0, 8);
   const rows = data.books.flatMap((book) => [
     ...(book.glossary || []).map((item) => ({ ...item, book: book.title, bookId: book.id, kind: "glossary", kindLabel: "术语", categoryLabel: item.category || "未分类", japanese: item.japanese, chinese: item.chinese, detail: item.definition || item.translatorNote || item.notes || "" })),
@@ -367,6 +396,7 @@ function renderGlossary() {
   <div class="section-head"><div><h2>已定稿 · 固定译名与译者注</h2><p>“含义 / 身份”就是 AI 译者提供、供读者阅读的译者注</p></div></div><div class="panel"><table class="table"><thead><tr><th>作品 / 分类</th><th>固定译名</th><th>含义 / 身份（译者注）</th><th>操作</th></tr></thead><tbody>${visibleRows.map((item) => `<tr><td><strong>${escapeHtml(item.book)}</strong><small class="subline">${escapeHtml(item.categoryLabel)}</small></td><td><strong>${escapeHtml(item.japanese)} → ${escapeHtml(item.chinese)}</strong><small class="subline">${escapeHtml(item.reading || "")}</small></td><td>${escapeHtml(cleanReaderExplanation(item.detail || "") || "待补充含义")}</td><td>${item.id && !data.books.find((book) => book.id === item.bookId)?.demo ? `<button data-approved-verify="${item.id}" data-book="${item.bookId}" data-kind="${item.kind}">AI 查证 / 编辑</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">当前筛选下没有已批准的固定译名。</td></tr>'}</tbody></table></div></div></details>`;
   request("/api/search-settings").then((settings) => { const target = document.querySelector("#quality-search-status"); if (target) target.textContent = searchStatus(settings); }).catch(() => {});
   content.querySelectorAll("[data-quality-chapter]").forEach((button) => button.onclick = () => renderWorkspace(button.dataset.qualityChapter, button.dataset.qualityChapterId));
+  content.insertAdjacentHTML("afterbegin", `<p class="notice">${analyzedChapters ? `已分析 ${analyzedChapters} 章；具体覆盖范围可在章节工具中查看。` : "尚未检查。完成翻译后会分析注释，零条记录不代表没有问题。"}</p>`);
   const form = document.querySelector("#glossary-form"); if (!data.books.some((book) => !book.demo)) form.innerHTML = '<div class="notice">导入真实作品后，可以在这里建立该书的术语表。</div>'; else form.addEventListener("submit", addGlossaryTerm);
   document.querySelector("#glossary-filter-book").onchange = (event) => { glossaryBookFilter = event.target.value; glossaryCategoryFilter = ""; renderGlossary(); };
   document.querySelector("#glossary-filter-category").onchange = (event) => { glossaryCategoryFilter = event.target.value; renderGlossary(); };
@@ -488,7 +518,7 @@ async function addGlossaryTerm(event) {
 
 function renderExports() {
   setHeader("Apple Books", "导出中心");
-  content.innerHTML = `<div class="export-primary"><p class="eyebrow">EPUB / APPLE BOOKS</p><h2>把已翻译的章节带到 iPad 阅读</h2></div><div class="panel">${data.books.map((book) => { const info = progress(book); return `<div class="export-card"><div><strong>${escapeHtml(book.title)}</strong><p style="margin:5px 0 0;color:var(--muted)">${info.approved} 个已标记定稿章节 · EPUB 3 可重排版</p></div><div><button data-approved="${book.id}">仅定稿版</button> <button class="primary" data-draft="${book.id}">导出可阅读版</button></div></div>`; }).join("") || '<div class="empty slim">书库为空。导入并翻译作品后，可以在这里导出 EPUB。</div>'}</div>
+  content.innerHTML = `<div class="export-primary"><p class="eyebrow">EPUB / APPLE BOOKS</p><h2>把已翻译的章节带到 iPad 阅读</h2></div><div class="panel">${data.books.map((book) => { const info = progress(book); return `<div class="export-card"><div><strong>${escapeHtml(book.title)}</strong><p style="margin:5px 0 0;color:var(--muted)">${info.approved} 个已标记定稿章节 · EPUB 3 可重排版</p></div><div><button data-approved="${book.id}" ${info.approved ? "" : "disabled"}>仅定稿版</button> <button class="primary" data-draft="${book.id}" ${book.chapters.some((c) => c.translation || c.translationPath || c.polishedPath || c.activeRevisionId) ? "" : "disabled"}>导出可阅读版</button></div></div>`; }).join("") || '<div class="empty slim">书库为空。导入并翻译作品后，可以在这里导出 EPUB。</div>'}</div>
   <div class="section-head"><div><h2>最近导出</h2><p>文件保存在本地 exports 目录</p></div></div><div class="panel">${(data.exports || []).map((item) => `<div class="export-card"><div><strong>${escapeHtml(item.filename)}</strong><p style="margin:5px 0 0;color:var(--muted)">${escapeHtml(item.bookTitle)} · ${item.chapterCount} 章 · ${formatDate(item.createdAt)}</p></div><a href="/api/exports/${encodeURIComponent(item.filename)}"><button>下载</button></a></div>`).join("") || '<div class="empty">尚未生成 EPUB</div>'}</div>`;
   content.querySelectorAll("[data-approved]").forEach((button) => button.onclick = () => exportEpub(button.dataset.approved, false));
   content.querySelectorAll("[data-draft]").forEach((button) => button.onclick = () => exportEpub(button.dataset.draft, true));
@@ -496,25 +526,48 @@ function renderExports() {
 
 async function exportEpub(bookId, includeDraft, chapterIds = [], selectionOnly = false) {
   try {
+    await load(); const book = data.books.find((b) => b.id === bookId);
+    const candidates = selectionOnly ? book.chapters.flatMap((c) => c.segments || []) : book.chapters.filter((c) => !chapterIds.length || chapterIds.includes(c.id));
+    const ready = candidates.filter((c) => (c.translation || c.translationPath || c.polishedPath || c.activeRevisionId) && (includeDraft || c.status === "approved"));
+    if (!ready.length) return notify("当前范围没有可导出的译文，请先翻译章节");
+    const dialog = document.createElement("dialog"); dialog.className = "export-preview";
+    dialog.innerHTML = `<div class="dialog-head"><h2>导出预览</h2><button id="cancel-export" aria-label="关闭导出预览">×</button></div><p>${escapeHtml(book.title)} · ${ready.length} 个章节${includeDraft ? "（含草稿）" : "（仅定稿）"}</p><p>将跳过 ${candidates.length - ready.length} 个无译文或不符合范围的章节。</p><ul>${ready.map((c) => `<li>${escapeHtml(c.title || c.label)}</li>`).join("")}</ul><div class="dialog-actions"><button id="confirm-export" class="primary">生成 EPUB</button></div>`;
+    document.body.append(dialog); dialog.showModal();
+    const accepted = await new Promise((resolve) => { dialog.querySelector("#cancel-export").onclick = () => { dialog.close(); resolve(false); }; dialog.querySelector("#confirm-export").onclick = () => { dialog.close(); resolve(true); }; dialog.oncancel = () => resolve(false); }); dialog.remove(); if (!accepted) return;
     notify("正在生成 EPUB…"); const result = await request(`/api/books/${bookId}/export/epub`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ includeDraft, chapterIds, selectionOnly }) });
     await load(); const anchor = document.createElement("a"); anchor.href = result.downloadUrl; anchor.click(); notify(`已生成 ${result.chapterCount} 章 EPUB`);
   } catch (error) { notify(error.message); }
 }
 
 async function renderSettings() {
-  setHeader("自带密钥 · BYOK", "API 设置");
+  setHeader("本机引擎", "翻译设置");
   let capabilities;
   try { [providerSettings, searchSettings, capabilities] = await Promise.all([request("/api/provider"), request("/api/search-settings"), request("/api/capabilities")]); }
   catch (error) { content.innerHTML = `<div class="empty"><strong>无法读取 API 配置</strong>${escapeHtml(error.message)}</div>`; return; }
-  const configured = providerSettings.baseUrl && providerSettings.model && (providerSettings.hasApiKey || providerSettings.noAuth);
+  const configured = providerSettings.backend && providerSettings.backend !== "http" || providerSettings.baseUrl && providerSettings.model && (providerSettings.hasApiKey || providerSettings.noAuth);
   const protectionText = providerSettings.keyProtection === "windows-dpapi" ? "密钥已使用 Windows 当前用户加密。" : providerSettings.hasApiKey ? "当前环境无法调用 Windows 加密，密钥以仅限本机配置文件方式保存。" : "尚未保存密钥。";
   const selectedPreset = matchingProviderPreset(providerSettings);
   const presetOptions = Object.entries(providerPresets).map(([id, preset]) => `<option value="${id}" ${selectedPreset === id ? "selected" : ""}>${escapeHtml(preset.label)}</option>`).join("");
   content.innerHTML = `<div class="settings-layout">
-    <section class="panel panel-pad storage-panel"><div class="section-head settings-head"><div><h2>本机数据</h2><p>书籍、译文、导出和 API 配置保存在此目录。</p></div></div><code>${escapeHtml(capabilities.dataDirectory || "")}</code><p>如需迁移，请先停止工作台，再复制整个数据目录；启动前可设置 <code>TRANSLATION_LIBRARY_DATA_DIR</code> 指向新位置。</p></section>
+    <section class="panel panel-pad lifecycle-panel"><div class="section-head settings-head"><div><h2>后台运行</h2><p>运行窗口可以最小化。关闭网页后，后台和翻译任务仍会继续。</p></div><button id="settings-shutdown">关闭后台</button></div></section>
+    <details class="panel panel-pad storage-panel"><summary>本机数据与迁移</summary><div class="section-head settings-head"><div><h2>本机数据</h2><p>书籍、译文、导出和 API 配置保存在此目录。</p></div></div><code>${escapeHtml(capabilities.dataDirectory || "")}</code><p>如需迁移，请先停止工作台，再复制整个数据目录；启动前可设置 <code>TRANSLATION_LIBRARY_DATA_DIR</code> 指向新位置。</p></details>
     <form class="panel panel-pad settings-form" id="provider-form">
-      <div class="section-head settings-head"><div><h2>翻译 API <span class="default-badge">翻译与注释</span></h2><p>选择服务商与模型；这把 Key 只用于翻译，不与联网搜索共用。</p></div>${configured ? '<span class="status approved">已配置</span>' : '<span class="status review">等待密钥</span>'}</div>
-      <label class="preset-picker">服务商与模型<select id="provider-preset">${presetOptions}<option value="custom" ${selectedPreset === "custom" ? "selected" : ""}>自定义 · OpenAI 兼容接口</option></select></label>
+      <div class="section-head settings-head"><div><h2>翻译引擎 <span class="default-badge">翻译与注释</span></h2><p>选择 API 或已安装的 CLI；翻译、精校与注释使用同一引擎。</p></div>${configured ? '<span class="status approved">已配置</span>' : '<span class="status review">待配置</span>'}</div>
+      <label>引擎<select id="provider-backend">${["http", "codex", "opencode", "antigravity"].map((id) => `<option value="${id}" ${id === (providerSettings.backend || "http") ? "selected" : ""}>${{ http: "翻译 API", codex: "Codex CLI", opencode: "OpenCode CLI", antigravity: "Antigravity CLI" }[id]}</option>`).join("")}</select></label>
+      <div id="cli-settings">
+      <label id="opencode-mode-label">OpenCode 连接方式<select id="opencode-mode"><option value="cli" ${providerSettings.opencodeMode !== "server" ? "selected" : ""}>直接调用 CLI</option><option value="server" ${providerSettings.opencodeMode === "server" ? "selected" : ""} ${providerSettings.supportsOpenCodeServer ? "" : "disabled"}>连接本地服务 · 在桌面端查看会话</option></select></label>
+      <p id="opencode-mode-notice">当前后台尚未加载本地服务接入，请关闭并重新启动瀟湘館后台后使用。</p>
+      <div id="opencode-server-settings">
+        <p>工作台与 OpenCode 桌面端请选择同一服务，并打开相同项目目录。生成的分段会话会保留在该目录下。</p>
+        <label>本地服务地址<input id="opencode-server-url" value="${escapeAttribute(providerSettings.opencodeServerUrl || "http://127.0.0.1:4096")}" placeholder="http://127.0.0.1:4096"/></label>
+        <label>固定项目目录<input id="opencode-directory" value="${escapeAttribute(providerSettings.opencodeDirectory || "")}" placeholder="桌面端打开的本机目录绝对路径"/></label>
+        <label>服务用户名<input id="opencode-username" value="${escapeAttribute(providerSettings.opencodeUsername || "opencode")}" autocomplete="off"/></label>
+        <label>服务密码（未设置认证时留空）<input id="opencode-password" type="password" autocomplete="new-password" placeholder="${providerSettings.hasOpenCodePassword ? "已保存；留空保持，更换服务或用户名后需重新填写" : "与 OpenCode 服务的密码一致"}"/></label>
+        <label class="check-row"><input type="checkbox" id="clear-opencode-password"/>清除已保存的服务密码</label>
+        <p>可在终端运行 <code>opencode serve --hostname 127.0.0.1 --port 4096</code> 启动服务。取消翻译只停止对应会话；关闭工作台后台后，共用服务仍可供桌面端使用。</p>
+      </div>
+      <label id="cli-path-label">可执行文件路径（留空自动检测）<input id="provider-cli-path" value="${escapeAttribute(providerSettings.cliPath || "")}" placeholder="原生 CLI 可执行文件的绝对路径"/></label><label>模型<select id="provider-cli-model-select"><option value="">引擎默认模型</option><option value="__manual">手动填写模型 ID</option></select></label><label id="manual-cli-model">模型 ID（OpenCode 使用 provider/model）<input id="provider-cli-model" value="${escapeAttribute(providerSettings.backend !== "http" ? providerSettings.model || "" : "")}"/></label><label>推理强度<select id="provider-effort"><option value="">默认强度</option></select></label><button type="button" id="load-cli-models">读取模型与强度</button><p id="cli-model-hint">读取本机模型目录后，可选择对应的强度。</p><button type="button" id="probe-cli">检测安装</button><p id="cli-probe-result" role="status">登录状态尚未验证；使用引擎已有登录，测试成功后确认可用。</p></div>
+      <div id="http-settings"><label class="preset-picker">服务商与模型<select id="provider-preset">${presetOptions}<option value="custom" ${selectedPreset === "custom" ? "selected" : ""}>自定义 · OpenAI 兼容接口</option></select></label>
       <div class="preset-note" id="preset-note"></div>
       <label>翻译 API 密钥<input id="provider-key" type="password" autocomplete="new-password" placeholder="${providerSettings.hasApiKey ? `已保存 ${escapeHtml(providerSettings.keyHint)}；留空则保持不变` : "粘贴 API Key"}"/></label>
       <details class="settings-advanced"><summary>高级设置：接口地址、模型参数与费用估算</summary>
@@ -526,10 +579,10 @@ async function renderSettings() {
       <div class="form-grid"><label>每百万输入 Token 价格<input id="provider-input-price" type="number" min="0" step="0.0001" value="${providerSettings.inputPrice || 0}"/></label><label>每百万输出 Token 价格<input id="provider-output-price" type="number" min="0" step="0.0001" value="${providerSettings.outputPrice || 0}"/></label></div>
       <label class="check-row"><input id="provider-no-auth" type="checkbox" ${providerSettings.noAuth ? "checked" : ""}/> 本机接口不需要 API 密钥</label>
       <label class="check-row"><input id="clear-provider-key" type="checkbox"/> 清除当前已保存的密钥</label>
-      </details>
-      <div class="notice">密钥只发送给你填写的 API 地址，网页不会重新显示完整密钥。${protectionText} 配置位于本机 <code>secrets</code> 目录；不要把该目录发给他人。</div>
+      </details></div>
+      <div id="provider-key-notice" class="notice">密钥只发送给你填写的 API 地址，网页不会重新显示完整密钥。${protectionText} 配置位于本机 <code>secrets</code> 目录；不要把该目录发给他人。</div>
       <div id="provider-test-result" class="notice hidden"></div>
-      <div class="dialog-actions"><button id="test-provider" type="button">测试已保存配置</button><button class="primary" type="submit">保存 API 配置</button></div>
+      <div class="dialog-actions"><button id="test-provider" type="button">测试并保存</button><button class="primary" type="submit">保存引擎配置</button></div>
     </form>
     <form class="panel panel-pad settings-form" id="search-settings-form">
       <div class="section-head settings-head"><div><h2>联网搜索 API <span class="default-badge">可选 · 独立配置</span></h2><p>只用于少量高风险说法的 AI 查证；不影响初译、译名释义和读者注释。</p></div><span class="status ${searchSettings.hasApiKey ? "approved" : "review"}">${searchSettings.hasApiKey ? "已配置" : "可选"}</span></div>
@@ -545,6 +598,48 @@ async function renderSettings() {
       <small>连接测试会实际发起一次搜索，计入今日额度；网页不会显示完整 Key。</small>
     </form>
   </div>`;
+  document.querySelector("#settings-shutdown").onclick = shutdownWorkbench;
+  let modelCatalog = [];
+  const backendSelect = document.querySelector("#provider-backend"), modelSelect = document.querySelector("#provider-cli-model-select"), modelInput = document.querySelector("#provider-cli-model"), effortSelect = document.querySelector("#provider-effort");
+  const effortLabels = { none: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "更高", max: "最高", ultra: "超高" };
+  const updateEffort = (saved = "") => {
+    const model = modelCatalog.find((m) => m.id === modelInput.value);
+    const options = model?.reasoningEfforts || [];
+    effortSelect.innerHTML = '<option value="">默认强度</option>' + options.map((value) => `<option value="${escapeAttribute(value)}">${escapeHtml(effortLabels[value] || value)}</option>`).join("");
+    effortSelect.value = options.includes(saved) ? saved : "";
+    effortSelect.disabled = !options.length;
+    document.querySelector("#manual-cli-model").hidden = modelSelect.value !== "__manual";
+  };
+  modelSelect.value = modelInput.value ? "__manual" : "";
+  modelSelect.onchange = () => { if (modelSelect.value !== "__manual") modelInput.value = modelSelect.value; else modelInput.value = ""; updateEffort(); };
+  modelInput.oninput = () => updateEffort();
+  const updateBackend = () => {
+    const cli = backendSelect.value !== "http", opencode = backendSelect.value === "opencode", server = opencode && document.querySelector("#opencode-mode").value === "server";
+    document.querySelector("#cli-settings").hidden = !cli; document.querySelector("#http-settings").hidden = cli; document.querySelector("#provider-key-notice").hidden = cli;
+    document.querySelector("#opencode-mode-label").hidden = !opencode; document.querySelector("#opencode-server-settings").hidden = !server; document.querySelector("#cli-path-label").hidden = server;
+    document.querySelector("#opencode-mode-notice").hidden = !opencode || Boolean(providerSettings.supportsOpenCodeServer);
+    document.querySelector("#probe-cli").textContent = server ? "检测服务与目录" : "检测安装";
+  }; updateBackend(); updateEffort();
+  backendSelect.onchange = () => { document.querySelector("#provider-cli-path").value = ""; document.querySelector("#cli-model-hint").textContent = "读取本机模型目录后，可选择对应的强度。"; document.querySelector("#cli-probe-result").textContent = "登录状态尚未验证；使用 CLI 已有登录，测试成功后确认可用。"; modelCatalog = []; modelInput.value = ""; modelSelect.innerHTML = '<option value="">CLI 默认模型</option><option value="__manual">手动填写模型 ID</option>'; updateBackend(); updateEffort(); };
+  for (const id of ["opencode-mode", "opencode-server-url", "opencode-directory", "opencode-username", "opencode-password", "clear-opencode-password", "provider-cli-path"]) document.getElementById(id).addEventListener("change", () => {
+    modelCatalog = []; modelSelect.innerHTML = '<option value="">引擎默认模型</option><option value="__manual">手动填写模型 ID</option>'; modelSelect.value = modelInput.value ? "__manual" : ""; updateEffort(); updateBackend();
+    document.querySelector("#cli-model-hint").textContent = "连接配置已变化，请重新读取模型与强度。"; document.querySelector("#cli-probe-result").textContent = "连接配置尚未检测。";
+  });
+  document.querySelector("#load-cli-models").onclick = async () => {
+    const button = document.querySelector("#load-cli-models"), hint = document.querySelector("#cli-model-hint"); const connection = JSON.stringify(cliConnectionPayload());
+    button.disabled = true; hint.textContent = "正在读取本机模型目录…";
+    try {
+      const result = await request("/api/provider/models", { method: "POST", headers: { "content-type": "application/json" }, body: connection });
+      if (connection !== JSON.stringify(cliConnectionPayload())) return;
+      modelCatalog = result.models; const selected = modelInput.value;
+      modelSelect.innerHTML = '<option value="">CLI 默认模型</option>' + modelCatalog.map((m) => `<option value="${escapeAttribute(m.id)}">${escapeHtml(m.name)}</option>`).join("") + '<option value="__manual">手动填写模型 ID</option>';
+      modelSelect.value = modelCatalog.some((m) => m.id === selected) ? selected : selected ? "__manual" : "";
+      updateEffort(backendSelect.value === providerSettings.backend && selected === providerSettings.model ? providerSettings.reasoningEffort : "");
+      hint.textContent = `${modelCatalog.length} 个模型 · ${result.hint}`;
+    } catch (e) { if (connection === JSON.stringify(cliConnectionPayload())) hint.textContent = e.message; } finally { button.disabled = false; }
+  };
+  if (providerSettings.backend && providerSettings.backend !== "http") document.querySelector("#load-cli-models").click();
+  document.querySelector("#probe-cli").onclick = async () => { const box = document.querySelector("#cli-probe-result"), connection = JSON.stringify(cliConnectionPayload()); box.textContent = "正在检测…"; try { const result = await request("/api/provider/probe", { method: "POST", headers: { "content-type": "application/json" }, body: connection }); if (connection !== JSON.stringify(cliConnectionPayload())) return; box.textContent = result.error || (result.mode === "server" ? `OpenCode ${result.version} · 服务可连接，项目目录匹配；模型调用需测试确认` : `${result.version || "已安装"} · 登录状态需测试确认`); } catch (e) { if (connection === JSON.stringify(cliConnectionPayload())) box.textContent = e.message; } };
   document.querySelector("#provider-preset").addEventListener("change", applyProviderPreset);
   document.querySelector("#provider-key").addEventListener("input", (event) => { if (event.target.value) document.querySelector("#clear-provider-key").checked = false; });
   document.querySelector("#test-provider").addEventListener("click", testProviderSettings);
@@ -574,11 +669,11 @@ async function testProviderSettings() {
   const button = document.querySelector("#test-provider"); const resultBox = document.querySelector("#provider-test-result");
   button.disabled = true; button.textContent = "正在测试…"; resultBox.classList.add("hidden");
   try {
-    const result = await request("/api/provider/test", { method: "POST" });
-    resultBox.textContent = `连接成功 · ${result.model} · ${result.latencyMs} ms · ${result.inputTokens} 输入 / ${result.outputTokens} 输出 Token`;
-    resultBox.classList.remove("hidden"); notify("API 网络、认证和响应格式均正常");
+    const result = await request("/api/provider/test", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...providerPayload(), save: true }) });
+    resultBox.textContent = `连接成功 · ${result.model} · ${result.latencyMs} ms · ${result.inputTokens ?? "未知"} 输入 / ${result.outputTokens ?? "未知"} 输出 Token`;
+    resultBox.classList.remove("hidden"); notify("引擎连接成功，配置已保存"); updateApiStatus();
   } catch (error) { resultBox.textContent = `测试失败：${error.message}`; resultBox.classList.remove("hidden"); }
-  finally { button.disabled = false; button.textContent = "测试已保存配置"; }
+  finally { button.disabled = false; button.textContent = "测试并保存"; }
 }
 
 function updatePresetNote() {
@@ -609,23 +704,37 @@ function applyProviderPreset(event) {
   updatePresetNote();
 }
 
+function cliConnectionPayload() {
+  return { backend: document.querySelector("#provider-backend").value, cliPath: document.querySelector("#provider-cli-path").value,
+    opencodeMode: document.querySelector("#opencode-mode").value, opencodeServerUrl: document.querySelector("#opencode-server-url").value, opencodeDirectory: document.querySelector("#opencode-directory").value,
+    opencodeUsername: document.querySelector("#opencode-username").value, opencodePassword: document.querySelector("#opencode-password").value, clearOpenCodePassword: document.querySelector("#clear-opencode-password").checked };
+}
+function providerPayload() {
+  const payload = { providerName: document.querySelector("#provider-name").value, protocol: document.querySelector("#provider-protocol").value, baseUrl: document.querySelector("#provider-url").value, model: document.querySelector("#provider-model").value, maxOutputTokens: Number(document.querySelector("#provider-max-output").value), inputPrice: Number(document.querySelector("#provider-input-price").value), outputPrice: Number(document.querySelector("#provider-output-price").value), apiKey: document.querySelector("#provider-key").value, noAuth: document.querySelector("#provider-no-auth").checked, clearKey: document.querySelector("#clear-provider-key").checked };
+  Object.assign(payload, cliConnectionPayload());
+  payload.reasoningEffort = document.querySelector("#provider-effort").value;
+  if (payload.backend !== "http") { payload.model = document.querySelector("#provider-cli-model").value.trim(); payload.providerName = payload.backend === "opencode" && payload.opencodeMode === "server" ? "OpenCode 本地服务" : `${payload.backend} CLI`; }
+  return payload;
+}
 async function saveProviderSettings(event) {
   event.preventDefault();
-  const payload = { providerName: document.querySelector("#provider-name").value, protocol: document.querySelector("#provider-protocol").value, baseUrl: document.querySelector("#provider-url").value, model: document.querySelector("#provider-model").value, maxOutputTokens: Number(document.querySelector("#provider-max-output").value), inputPrice: Number(document.querySelector("#provider-input-price").value), outputPrice: Number(document.querySelector("#provider-output-price").value), apiKey: document.querySelector("#provider-key").value, noAuth: document.querySelector("#provider-no-auth").checked, clearKey: document.querySelector("#clear-provider-key").checked };
+  const payload = providerPayload();
   const providerChanged = originOf(providerSettings.baseUrl) && originOf(payload.baseUrl) && originOf(providerSettings.baseUrl) !== originOf(payload.baseUrl);
-  if (providerChanged && !payload.noAuth && !payload.apiKey) { const box = document.querySelector("#provider-test-result"); box.classList.remove("hidden"); box.textContent = "切换服务商时，请填写新服务商的 API Key"; return; }
+  if (payload.backend === "http" && providerChanged && !payload.noAuth && !payload.apiKey) { const box = document.querySelector("#provider-test-result"); box.classList.remove("hidden"); box.textContent = "切换服务商时，请填写新服务商的 API Key"; return; }
   try { providerSettings = await request("/api/provider", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }); notify("API 配置已保存在本机"); renderSettings(); updateApiStatus(); }
   catch (error) { const box = document.querySelector("#provider-test-result"); box.classList.remove("hidden"); box.textContent = `保存翻译 API 失败：${error.message}`; }
 }
 
 async function updateApiStatus() {
-  try { const settings = await request("/api/provider"); const ready = settings.baseUrl && settings.model && (settings.hasApiKey || settings.noAuth); document.querySelector("#api-status").textContent = ready ? `API：${settings.providerName || settings.model}` : "API：尚未配置"; }
+  try { const settings = await request("/api/provider"); const ready = settings.backend && settings.backend !== "http" || settings.baseUrl && settings.model && (settings.hasApiKey || settings.noAuth); document.querySelector("#api-status").textContent = ready ? `API：${settings.providerName || settings.model}` : "API：尚未配置"; }
   catch { document.querySelector("#api-status").textContent = "API：配置不可用"; }
 }
 
 function switchView(view) {
+  if (currentView === "closed") return;
   if (!confirmDiscardReaderEdit()) return;
   if (taskPollTimer) { clearTimeout(taskPollTimer); taskPollTimer = null; }
+  leaveReader(); route(`/${view}`); searchInput.disabled = view !== "library";
   currentView = view; document.querySelectorAll(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.view === view));
   ({ library: renderLibrary, tasks: renderTasks, glossary: renderGlossary, uncertainties: renderGlossary, exports: renderExports, settings: renderSettings }[view] || renderLibrary)();
 }
@@ -634,7 +743,7 @@ async function importBook(event) {
   event.preventDefault(); const file = document.querySelector("#book-file").files[0]; if (!file) return;
   const params = new URLSearchParams({ filename: file.name, title: document.querySelector("#book-title").value || file.name.replace(/\.[^.]+$/, ""), author: document.querySelector("#book-author").value, profile: document.querySelector("#book-profile").value, sourceLanguage: document.querySelector("#book-language").value });
   const button = document.querySelector("#confirm-import"); button.disabled = true; button.textContent = "正在导入…";
-  try { await request(`/api/import?${params}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: file }); document.querySelector("#import-dialog").close(); document.querySelector("#import-form").reset(); await load(); switchView("library"); notify("书籍已保存到本地，等待章节识别"); }
+  try { const imported = await request(`/api/import?${params}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: file }); document.querySelector("#import-dialog").close(); document.querySelector("#import-form").reset(); await load(); renderBook(imported.id); notify("书籍已保存，正在自动整理目录"); }
   catch (error) { notify(error.message); }
   finally { button.disabled = false; button.textContent = "导入到本地书库"; }
 }
@@ -643,6 +752,7 @@ async function load() { data = await request("/api/library"); }
 
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => switchView(item.dataset.view)));
 document.querySelector("#import-button").onclick = openImportDialog;
+document.querySelector("#shutdown-server").onclick = shutdownWorkbench;
 document.querySelector("#import-form").addEventListener("submit", importBook);
 document.querySelector("#edit-book-form").addEventListener("submit", saveBookDetails);
 document.querySelectorAll("[data-close-dialog]").forEach((button) => button.onclick = () => document.querySelector(`#${button.dataset.closeDialog}`).close());
@@ -661,5 +771,5 @@ try {
   document.querySelector("#local-status").title = `EPUB 已就绪 · ${calibreStatus} · ${ocrStatus}`;
   document.querySelector("#local-status").insertAdjacentHTML("afterend", '<div id="api-status" class="local-status">API：正在检查…</div>');
   await updateApiStatus();
-  renderLibrary();
+  await restoreRoute();
 } catch (error) { content.innerHTML = `<div class="empty"><strong>无法读取本地书库</strong>${escapeHtml(error.message)}</div>`; }

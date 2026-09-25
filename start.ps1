@@ -1,4 +1,4 @@
-param([switch]$NoBrowser)
+param([switch]$NoBrowser, [switch]$ShowConsole)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -32,9 +32,13 @@ $env:NODE_USE_ENV_PROXY = "1"
 
 $logDir = Join-Path $root "logs"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-$process = Start-Process -FilePath $node -ArgumentList @("server.mjs") -WorkingDirectory $root `
-    -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logDir "server.stdout.log") `
-    -RedirectStandardError (Join-Path $logDir "server.stderr.log") -PassThru
+if ($ShowConsole) {
+    $process = Start-Process -FilePath $node -ArgumentList @("server.mjs") -WorkingDirectory $root -WindowStyle Normal -PassThru
+} else {
+    $process = Start-Process -FilePath $node -ArgumentList @("server.mjs") -WorkingDirectory $root `
+        -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logDir "server.stdout.log") `
+        -RedirectStandardError (Join-Path $logDir "server.stderr.log") -PassThru
+}
 
 Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ascii
 

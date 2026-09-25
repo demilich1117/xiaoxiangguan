@@ -1,3 +1,8 @@
+import { discoverCliModels, validateCliChoice } from "./lib/cli-models.mjs";
+import { probeCli } from "./lib/cli-provider.mjs";
+import { OpenCodeServer, usesOpenCodeServer, discoverOpenCodeServerModels, probeOpenCodeServer, stopOpenCodeSessions } from "./lib/opencode-server.mjs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { sourceParagraphs, sourceFingerprint, revisionSegments } from "./lib/alignment.mjs";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync } from "node:fs";
@@ -5,13 +10,14 @@ import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs
 import { basename, dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createEpub } from "./lib/epub.mjs";
-import { analyzeChapterEntities, extractDocument, identifyHighRisk, japaneseOcrPath, ocrStatus, readChapterText, testProviderConnection, translateChapter, writeTranslation } from "./lib/engine.mjs";
+import { analyzeChapterEntities, checkControl, waitControl, extractDocument, identifyHighRisk, japaneseOcrPath, ocrStatus, readChapterText, testProviderConnection, translateChapter, writeTranslation } from "./lib/engine.mjs";
 import { SOURCE_LANGUAGES, sourceLanguage } from "./public/languages.js";
 import { searchResearchSources, verifyIssue } from "./lib/research.mjs";
 import { createSearchBudget } from "./lib/search-budget.mjs";
-import { canAutoRevise, canAutoReviseFromEvidence, newRevisionId, preserveChapterRevisionState } from "./lib/revisions.mjs";
+import { activeRevisionPath, preserveLegacyRevision, canAutoRevise, canAutoReviseFromEvidence, newRevisionId, preserveChapterRevisionState } from "./lib/revisions.mjs";
 import { dataRoot } from "./lib/data-paths.mjs";
 import { toolCandidates } from "./lib/tool-paths.mjs";
+import { trackChild, stopChildProcesses } from "./lib/child-processes.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(ROOT, "public");
@@ -36,7 +42,7 @@ await mkdir(SECRETS, { recursive: true });
 
 try {
   const startupData = JSON.parse(await readFile(DATA_FILE, "utf8")); let changed = false;
-  for (const book of startupData.books || []) for (const task of book.tasks || []) if (task.status === "running") { task.status = "failed"; task.error = "应用在任务执行期间重启，请重新发起该步骤"; changed = true; }
+  for (const book of startupData.books || []) for (const task of book.tasks || []) if (["queued", "running", "paused"].includes(task.status)) { task.status = "failed"; task.error = "应用在任务执行期间重启；已完成块保留，可继续翻译"; const chapter = book.chapters?.find((c) => c.translationRun?.id === task.id); if (chapter?.translationRun?.status === "running") { chapter.translationRun.status = "failed"; chapter.translationRun.error = task.error; } changed = true; }
   if (changed) await writeFile(DATA_FILE, `${JSON.stringify(startupData, null, 2)}\n`, "utf8");
 } catch { /* library initialization will report a useful error later */ }
 
@@ -65,13 +71,13 @@ async function saveLibrary(data) {
 }
 function json(res, status, payload) { res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }); res.end(JSON.stringify(payload)); }
 function safeName(value) { return basename(value).replace(/[^\p{L}\p{N}._ -]/gu, "-").slice(0, 160) || "book"; }
-const providerDefaults = { providerName: "OpenAI · Luna", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", model: "gpt-6-luna", maxOutputTokens: 8192, inputPrice: 0.1, outputPrice: 0.5, noAuth: false };
+const providerDefaults = { backend: "http", cliPath: "", reasoningEffort: "", timeoutMs: 300000, opencodeMode: "cli", opencodeServerUrl: "http://127.0.0.1:4096", opencodeDirectory: ROOT, opencodeUsername: "opencode", providerName: "OpenAI · Luna", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", model: "gpt-6-luna", maxOutputTokens: 8192, inputPrice: 0.1, outputPrice: 0.5, noAuth: false };
 const searchDefaults = { dailyLimit: 30, autoItemsPerChapter: 3, requestsPerItem: 2 };
 let searchDailyLimit = 30;
 const searchBudget = createSearchBudget({ file: join(DATA, "search-usage.json"), cacheFile: SEARCH_CACHE_FILE, dailyLimit: () => searchDailyLimit });
 function secretOperation(mode, value) {
   return new Promise((resolveSecret, reject) => {
-    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(ROOT, "scripts", "secret.ps1"), "-Mode", mode], { windowsHide: true });
+    const child = trackChild(spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(ROOT, "scripts", "secret.ps1"), "-Mode", mode], { windowsHide: true, detached: process.platform !== "win32" }));
     let stdout = ""; let stderr = ""; child.stdout.on("data", (chunk) => { stdout += chunk.toString(); }); child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     child.on("error", reject); child.on("close", (code) => code === 0 ? resolveSecret(stdout) : reject(new Error(stderr || "Windows credential protection failed"))); child.stdin.end(value);
   });
@@ -80,10 +86,12 @@ async function readProvider() {
   if (!existsSync(PROVIDER_FILE)) return { ...providerDefaults };
   const stored = JSON.parse(await readFile(PROVIDER_FILE, "utf8"));
   const apiKey = stored.apiKeyProtected ? await secretOperation("Unprotect", stored.apiKeyProtected) : (stored.apiKey || "");
+  const opencodePassword = stored.opencodePasswordProtected ? await secretOperation("Unprotect", stored.opencodePasswordProtected) : (stored.opencodePassword || "");
+  delete stored.opencodePasswordProtected; delete stored.opencodePassword;
   delete stored.apiKeyProtected; delete stored.apiKey;
   if (!stored.providerName && !stored.baseUrl && !stored.model) return { ...providerDefaults, apiKey };
-  const merged = { ...providerDefaults, ...stored, apiKey };
-  for (const key of ["providerName", "baseUrl", "model"]) if (!merged[key]) merged[key] = providerDefaults[key];
+  const merged = { ...providerDefaults, ...stored, apiKey, opencodePassword };
+  for (const key of ["providerName", "baseUrl", ...(!merged.backend || merged.backend === "http" ? ["model"] : [])]) if (!merged[key]) merged[key] = providerDefaults[key];
   return merged;
 }
 async function readSearchSettings() {
@@ -119,11 +127,28 @@ async function saveSearchSettings(body) {
   return publicSearchSettings({ ...next, apiKey });
 }
 function publicProvider(settings) {
-  const { apiKey, apiKeyProtected, ...safe } = settings;
-  return { ...safe, hasApiKey: Boolean(apiKey), keyHint: apiKey ? `••••${apiKey.slice(-4)}` : "" };
+  const { apiKey, apiKeyProtected, opencodePassword, opencodePasswordProtected, ...safe } = settings;
+  return { ...safe, hasApiKey: Boolean(apiKey), keyHint: apiKey ? `••••${apiKey.slice(-4)}` : "", hasOpenCodePassword: Boolean(opencodePassword), supportsOpenCodeServer: true };
+}
+function openCodeSettings(body, existing) {
+  const next = Object.fromEntries(["opencodeMode", "opencodeServerUrl", "opencodeDirectory", "opencodeUsername"].map((key) => [key, String(body[key] ?? existing[key] ?? providerDefaults[key]).trim()]));
+  next.opencodeServerUrl = next.opencodeServerUrl.replace(/\/+$/, "");
+  if (!["cli", "server"].includes(next.opencodeMode)) throw new Error("不支持的 OpenCode 连接方式");
+  const sameServer = next.opencodeServerUrl === existing.opencodeServerUrl && next.opencodeUsername === existing.opencodeUsername;
+  next.opencodePassword = body.clearOpenCodePassword ? "" : String(body.opencodePassword || "") || (sameServer ? existing.opencodePassword || "" : "");
+  return next;
+}
+async function providerForRequest(body) {
+  const existing = await readProvider();
+  return { ...existing, ...body, ...openCodeSettings(body, existing) };
+}
+async function discoverProviderModels(provider, refresh = false) {
+  return usesOpenCodeServer(provider) ? discoverOpenCodeServerModels(provider) : discoverCliModels(provider.backend, provider.cliPath, refresh);
 }
 async function saveProvider(body) {
   const existing = await readProvider();
+  const backend = body.backend || existing.backend || "http";
+  if (!["http", "codex", "opencode", "antigravity"].includes(backend)) throw new Error("不支持的翻译引擎");
   const protocol = String(body.protocol || existing.protocol);
   if (!["openai-chat", "openai-responses"].includes(protocol)) throw new Error("不支持的接口协议");
   const baseUrl = String(body.baseUrl ?? existing.baseUrl).trim().replace(/\/+$/, "");
@@ -136,6 +161,8 @@ async function saveProvider(body) {
   const nextOrigin = (() => { try { return new URL(baseUrl).origin; } catch { return ""; } })();
   const providerChanged = Boolean(previousOrigin && nextOrigin && previousOrigin !== nextOrigin);
   const next = {
+    ...openCodeSettings(body, existing),
+    backend, reasoningEffort: String(body.reasoningEffort ?? existing.reasoningEffort ?? ""), cliPath: String(body.cliPath ?? existing.cliPath ?? "").trim(), timeoutMs: Math.max(1000, Math.min(1800000, Number(body.timeoutMs || existing.timeoutMs || 300000))),
     providerName: String(body.providerName ?? existing.providerName).trim(), protocol, baseUrl,
     model: String(body.model ?? existing.model).trim(),
     maxOutputTokens: Math.min(131072, Math.max(256, Number(body.maxOutputTokens || existing.maxOutputTokens || 8192))),
@@ -144,8 +171,17 @@ async function saveProvider(body) {
     noAuth: Boolean(body.noAuth),
     apiKey: incomingKey || (body.clearKey || providerChanged ? "" : (existing.apiKey || "")), updatedAt: new Date().toISOString()
   };
+  if (backend !== "http") {
+    if (usesOpenCodeServer(next)) new OpenCodeServer(next);
+    const catalog = next.reasoningEffort ? await discoverProviderModels(next) : null;
+    validateCliChoice(next, catalog);
+  }
   const temp = `${PROVIDER_FILE}.tmp`;
-  const { apiKey, ...stored } = next;
+  const { apiKey, opencodePassword, ...stored } = next;
+  if (opencodePassword) {
+    try { stored.opencodePasswordProtected = await secretOperation("Protect", opencodePassword); stored.opencodePasswordProtection = "windows-dpapi"; }
+    catch { stored.opencodePassword = opencodePassword; stored.opencodePasswordProtection = "local-file-fallback"; }
+  } else stored.opencodePasswordProtection = "none";
   if (apiKey) {
     try { stored.apiKeyProtected = await secretOperation("Protect", apiKey); stored.keyProtection = "windows-dpapi"; }
     catch { stored.apiKey = apiKey; stored.keyProtection = "local-file-fallback"; }
@@ -168,6 +204,10 @@ function tesseractPath() {
   return japaneseOcrPath();
 }
 function bookRoot(book) { return join(LIBRARY, book.id); }
+async function preserveExistingRevision(root, chapter) {
+  if (!activeRevisionPath(chapter) && chapter.translation?.trim()) chapter.translationPath = await writeTranslation(root, chapter, chapter.translation, false, `legacy-${newRevisionId()}`);
+  preserveLegacyRevision(chapter);
+}
 async function initializeProject(root, book, sourceFile) {
   for (const path of ["extracted", "chapters", "translations/working", "translations/polished", "state"]) await mkdir(join(root, path), { recursive: true });
   const state = join(root, "state"); const now = new Date().toISOString();
@@ -240,35 +280,50 @@ async function syncProjectMetadata(book) {
 }
 const taskControls = new Map();
 let taskQueue = Promise.resolve();
-const bookMutationQueues = new Map();
+let stopping = false, shutdownPromise, shutdownDeadline;
+// All library read/modify/write transactions share one lock, including different books.
+const mutationContext = new AsyncLocalStorage();
+let mutationQueue = Promise.resolve();
 function withBookMutation(bookId, operation) {
-  const next = (bookMutationQueues.get(bookId) || Promise.resolve()).then(operation);
-  bookMutationQueues.set(bookId, next.catch(() => {}));
-  return next;
+  if (mutationContext.getStore()) return operation();
+  const next = mutationQueue.then(() => mutationContext.run(true, operation));
+  mutationQueue = next.catch(() => {}); return next;
 }
 async function updateTask(taskId, changes) {
-  const data = await readLibrary();
-  for (const book of data.books) { const task = (book.tasks || []).find((item) => item.id === taskId); if (task) { Object.assign(task, changes, { updatedAt: new Date().toISOString() }); await saveLibrary(data); return task; } }
-  return null;
-}
-async function startTask(bookId, type, detail, runner) {
-  const data = await readLibrary(); const book = data.books.find((item) => item.id === bookId); if (!book) throw new Error("作品不存在");
-  const duplicate = (book.tasks || []).find((item) => item.status === "running" && item.type === type && item.detail === detail);
-  if (duplicate) return duplicate;
-  const task = { id: `task-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`, type, status: "running", progress: 0, detail, createdAt: new Date().toISOString() };
-  book.tasks ||= []; book.tasks.unshift(task); await saveLibrary(data);
-  const control = { paused: false, cancelled: false }; taskControls.set(task.id, control);
-  taskQueue = taskQueue.then(async () => {
-    try { await runner(task, control); if (!control.cancelled) await updateTask(task.id, { status: "completed", progress: 100 }); }
-    catch (error) { await updateTask(task.id, { status: control.cancelled ? "cancelled" : "failed", error: error.message, detail: `${detail} · ${error.message}` }); }
-    finally { taskControls.delete(task.id); }
+  return withBookMutation(null, async () => {
+    const data = await readLibrary();
+    for (const book of data.books) { const task = (book.tasks || []).find((i) => i.id === taskId); if (task) { Object.assign(task, changes, { updatedAt: new Date().toISOString() }); await saveLibrary(data); return task; } }
+    return null;
   });
-  return task;
+}
+async function startTask(bookId, type, detail, runner, metadata = {}) {
+  return withBookMutation(bookId, async () => {
+    if (stopping) throw new Error("后台正在关闭，请重新启动后再操作");
+    const data = await readLibrary(); const book = data.books.find((i) => i.id === bookId); if (!book) throw new Error("作品不存在");
+    const duplicate = (book.tasks || []).find((i) => ["queued", "running", "paused"].includes(i.status) && i.type === type && i.requestKey === detail);
+    if (duplicate) return duplicate;
+    const task = { id: `task-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`, type, status: "queued", progress: 0, detail, requestKey: detail, createdAt: new Date().toISOString(), ...metadata };
+    book.tasks ||= []; book.tasks.unshift(task); await saveLibrary(data);
+    const controller = new AbortController();
+    const control = { paused: false, cancelled: false, started: false, controller, signal: controller.signal }; taskControls.set(task.id, control);
+    // Leave the mutation context before executing long-running model work.
+    taskQueue = taskQueue.catch(() => {}).then(() => mutationContext.run(false, async () => {
+      try {
+        await waitControl(control); control.started = true; await updateTask(task.id, { status: "running" }); console.log(`任务开始：${type}`);
+        await runner(task, control); checkControl(control); await updateTask(task.id, { status: "completed", progress: 100 }); console.log(`任务完成：${type}`);
+      } catch (error) { await updateTask(task.id, { status: control.cancelled ? "cancelled" : "failed", error: error.message, detail: `${detail} · ${error.message}` }); console.log(`任务${control.cancelled ? "已停止" : "未完成"}：${type}`); }
+      finally { taskControls.delete(task.id); }
+    }));
+    return task;
+  });
 }
 async function extractBookTask(bookId) {
-  return startTask(bookId, "章节提取", "识别目录和正文", async (task) => {
+  return startTask(bookId, "章节提取", "识别目录和正文", async (task, control) => {
     const data = await readLibrary(); const book = data.books.find((item) => item.id === bookId); await updateTask(task.id, { progress: 8, detail: book.format === "AZW3" ? "Calibre 正在转换 AZW3；大型合集可能需要数分钟" : "正在读取原文件" });
-    const result = await extractDocument({ book, bookRoot: bookRoot(book), calibrePath: calibrePath() });
+    const result = await extractDocument({ book, bookRoot: bookRoot(book), calibrePath: calibrePath(), signal: control.signal });
+    checkControl(control);
+    await withBookMutation(bookId, async () => {
+    checkControl(control);
     const fresh = await readLibrary(); const target = fresh.books.find((item) => item.id === bookId); const previous = new Map((target.chapters || []).map((chapter) => [chapter.id, chapter]));
     target.chapters = result.chapters.map((chapter) => {
       const old = previous.get(chapter.id); if (!old) return chapter;
@@ -283,6 +338,7 @@ async function extractBookTask(bookId) {
     if (result.metadata.creator && !target.author) target.author = result.metadata.creator;
     if (result.pagesNeedingOcr.length) target.uncertainties.push({ id: `ocr-${Date.now()}`, chapter: "PDF", type: "OCR", text: `${result.pagesNeedingOcr.length} 页未提取到足够文本`, note: `可能需要 OCR：${result.pagesNeedingOcr.slice(0, 40).join("、")}`, status: "open" });
     await saveLibrary(fresh); await syncProjectState(target); await updateTask(task.id, { progress: 96, detail: `已整理 ${target.works.length || 1} 部作品、${result.chapters.length} 个正文单元` });
+    });
   });
 }
 function selectSourceRange(source, range = { type: "whole" }) {
@@ -291,11 +347,12 @@ function selectSourceRange(source, range = { type: "whole" }) {
   if (type === "paragraphs") {
     const paragraphs = source.split(/\n\s*\n/).map((item) => item.trim()).filter(Boolean);
     const start = Math.max(1, Number(range.start || 1)); const end = Math.min(paragraphs.length, Number(range.end || start));
-    if (!paragraphs.length || end < start) throw new Error("段落范围无效");
+    if (!Number.isInteger(start) || !Number.isInteger(end) || !paragraphs.length || end < start) throw new Error("段落范围无效");
     return { source: paragraphs.slice(start - 1, end).join("\n\n"), label: `第 ${start}–${end} 段`, partial: true, range: { type, start, end } };
   }
   if (type === "pages") {
     const start = Math.max(1, Number(range.start || 1)); const end = Math.max(start, Number(range.end || start));
+    if (!Number.isInteger(start) || !Number.isInteger(end)) throw new Error("页码范围无效");
     const blocks = [...source.matchAll(/\[\[PDF_PAGE_(\d+)\]\]\s*([\s\S]*?)(?=\[\[PDF_PAGE_\d+\]\]|$)/g)]
       .filter((match) => Number(match[1]) >= start && Number(match[1]) <= end)
       .map((match) => match[2].trim()).filter(Boolean);
@@ -304,85 +361,97 @@ function selectSourceRange(source, range = { type: "whole" }) {
   }
   throw new Error("不支持的翻译范围");
 }
-async function translateBookChapter(bookId, chapterId, mode, range) {
+async function translateBookChapter(bookId, chapterId, mode, range, retry = false) {
   const rangeLabel = range?.type === "paragraphs" ? `第 ${range.start}–${range.end} 段` : range?.type === "pages" ? `PDF 第 ${range.start}–${range.end} 页` : "整章";
+  // Freeze configuration when queued; never persist API keys in task or block metadata.
+  const provider = await readProvider();
+  if (provider.backend && provider.backend !== "http") validateCliChoice(provider, provider.reasoningEffort ? await discoverProviderModels(provider) : null);
+  const engine = { reasoningEffort: provider.reasoningEffort || "", backend: provider.backend || "http", protocol: provider.protocol, model: provider.model, baseUrl: provider.baseUrl, maxOutputTokens: provider.maxOutputTokens, inputPrice: provider.inputPrice, outputPrice: provider.outputPrice, cliPath: provider.cliPath || "" };
+  if (usesOpenCodeServer(provider)) Object.assign(engine, { opencodeMode: "server", opencodeServerUrl: provider.opencodeServerUrl, opencodeDirectory: provider.opencodeDirectory });
   return startTask(bookId, mode === "refine" ? "译文精校" : "章节翻译", `${chapterId} · ${rangeLabel}`, async (task, control) => {
-    let data = await readLibrary(); let book = data.books.find((item) => item.id === bookId); let chapter = book?.chapters.find((item) => item.id === chapterId); if (!chapter) throw new Error("章节不存在");
+    let data = await readLibrary(); let book = data.books.find((i) => i.id === bookId); let chapter = book?.chapters.find((i) => i.id === chapterId); if (!chapter) throw new Error("章节不存在");
     const root = bookRoot(book); const fullSource = await readChapterText(root, chapter, "source"); if (!fullSource.trim()) throw new Error("本章没有可翻译原文");
     const selected = selectSourceRange(fullSource, range);
-    if (selected.partial && mode === "refine") throw new Error("节选当前仅支持初译；译后可在节选卡片中编辑和批准");
-    const chapterIndex = book.chapters.findIndex((item) => item.id === chapterId); const previous = chapterIndex > 0 ? book.chapters[chapterIndex - 1] : null;
-    const previousText = previous ? await readChapterText(root, previous, previous.polishedPath ? "polished" : "translation") : "";
-    const existingDraft = await readChapterText(root, chapter, chapter.polishedPath ? "polished" : "translation");
-    const startingRevisionId = chapter.revisionId || null;
+    if (selected.partial && mode === "refine") throw new Error("节选请在节选卡片中编辑");
+    const allParagraphs = sourceParagraphs(fullSource, chapterId);
+    const paragraphs = selected.range?.type === "paragraphs" ? allParagraphs.slice(selected.range.start - 1, selected.range.end) : selected.partial ? sourceParagraphs(selected.source, chapterId) : allParagraphs;
+    const fingerprint = sourceFingerprint(paragraphs);
+    const existingDraft = await readChapterText(root, chapter, "current");
+    const startingRevisionId = chapter.activeRevisionId || chapter.revisionId || null;
+
+    const previous = book.chapters[book.chapters.findIndex((i) => i.id === chapterId) - 1];
+    const previousText = previous ? await readChapterText(root, previous, "current") : "";
     if (mode === "refine" && !existingDraft.trim()) throw new Error("请先完成本章初译");
-    if (!selected.partial) await withBookMutation(bookId, async () => {
-      const latest = await readLibrary(); const currentBook = latest.books.find((entry) => entry.id === bookId); const current = currentBook?.chapters.find((entry) => entry.id === chapterId);
-      if (current && (current.revisionId || null) === startingRevisionId) { current.status = "translating"; await saveLibrary(latest); }
+    const oldRun = chapter.translationRun;
+    const compatible = oldRun && oldRun.fingerprint === fingerprint && oldRun.mode === mode && oldRun.baseRevisionId === startingRevisionId && JSON.stringify(oldRun.engine) === JSON.stringify(engine) && oldRun.partial === selected.partial && JSON.stringify(oldRun.range) === JSON.stringify(selected.range || { type: "whole" });
+    if (retry && !compatible) throw new Error("原文、当前版本或引擎已变化，请重新开始翻译");
+    const run = { id: task.id, mode, partial: selected.partial, range: selected.range || { type: "whole" }, fingerprint, baseRevisionId: startingRevisionId, engine, blocks: retry && compatible ? oldRun.blocks.filter((b) => b.status === "completed") : [], status: "running" };
+    await withBookMutation(bookId, async () => {
+      checkControl(control); const latest = await readLibrary(); const current = latest.books.find((b) => b.id === bookId)?.chapters.find((c) => c.id === chapterId);
+      current.sourceParagraphs = allParagraphs; current.translationRun = run;
+      await saveLibrary(latest);
     });
-    const provider = await readProvider();
+    const persistRun = async (status) => withBookMutation(bookId, async () => {
+      const latest = await readLibrary(); const current = latest.books.find((b) => b.id === bookId)?.chapters.find((c) => c.id === chapterId);
+      if (current?.translationRun?.id === task.id) { current.translationRun = { ...run, status }; await saveLibrary(latest); }
+    });
     let result;
     try {
-      result = await translateChapter({ provider, book, chapter, source: selected.source, previousTail: previousText.slice(-1200), glossary: book.glossary || [], characters: book.characters || [], existingDraft, mode, control, onProgress: (progress, detailText) => updateTask(task.id, { progress, detail: `${chapter.title} · ${selected.label} · ${detailText}` }) });
-    } catch (error) {
-      if (!selected.partial) await withBookMutation(bookId, async () => {
-        const failedData = await readLibrary(); const failedBook = failedData.books.find((item) => item.id === bookId); const failedChapter = failedBook?.chapters.find((item) => item.id === chapterId);
-        if (failedChapter && (failedChapter.revisionId || null) === startingRevisionId) { failedChapter.status = "failed"; failedChapter.updatedAt = new Date().toISOString(); await saveLibrary(failedData); await syncProjectState(failedBook); }
+      result = await translateChapter({ provider, book, chapter, source: selected.source, paragraphs, existingDraft, mode, previousTail: previousText.slice(-1200), glossary: book.glossary || [], characters: book.characters || [], control, resumeBlocks: run.blocks,
+        onProgress: (progress, detail) => updateTask(task.id, { progress, detail: `${chapter.title} · ${detail}` }),
+        onBlock: (block) => withBookMutation(bookId, async () => {
+          checkControl(control);
+          run.blocks = [...run.blocks.filter((b) => b.id !== block.id), block].sort((a, b) => a.order - b.order);
+          await persistRun("running"); checkControl(control);
+        }) });
+      await waitControl(control);
+      await withBookMutation(bookId, async () => {
+        checkControl(control); data = await readLibrary(); book = data.books.find((i) => i.id === bookId); chapter = book?.chapters.find((i) => i.id === chapterId); if (!chapter) throw new Error("作品已移除");
+        await preserveExistingRevision(root, chapter);
+        const revisionId = newRevisionId(); const outputPath = await writeTranslation(root, chapter, result.text, mode === "refine", `ai-${revisionId}`, control.signal);
+        checkControl(control);
+        const protectedRevision = (chapter.activeRevisionId || chapter.revisionId || null) !== startingRevisionId || chapter.draftOrigin === "reader" || chapter.status === "approved" || chapter.exportedAt;
+        if (selected.partial) {
+          chapter.segments ||= []; chapter.segments.unshift({ id: `segment-${revisionId}`, label: selected.label, range: selected.range, sourceParagraphIds: paragraphs.map((p) => p.id), segments: result.segments, source: selected.source, translationPath: outputPath, status: "review", createdAt: new Date().toISOString() });
+        } else {
+          chapter.revisionHistory.push({ id: revisionId, path: outputPath, origin: "ai", segments: result.segments, engine, createdAt: new Date().toISOString(), reason: protectedRevision ? "新译稿已保留，读者版本未覆盖；可在历史中采用" : mode === "refine" ? "AI 精校" : "AI 初译" });
+          if (!protectedRevision) {
+            if (mode === "refine") chapter.polishedPath = outputPath; else chapter.translationPath = outputPath;
+            chapter.activeRevisionId = revisionId; chapter.revisionId = revisionId; chapter.draftOrigin = "ai"; chapter.status = "review"; chapter.exportedAt = null;
+          }
+          run.adopted = !protectedRevision;
+        }
+        run.status = "completed"; chapter.translationRun = run; chapter.updatedAt = new Date().toISOString(); chapter.lastModel = provider.model;
+        chapter.usage ||= { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+        for (const key of ["inputTokens", "outputTokens", "estimatedCost"]) chapter.usage[key] = result[key] == null ? null : (chapter.usage[key] || 0) + result[key];
+        checkControl(control); await saveLibrary(data); await syncProjectState(book);
       });
-      throw error;
-    }
-    const segmentId = selected.partial ? `segment-${Date.now()}-${Math.random().toString(16).slice(2, 6)}` : "";
-    const revisionId = newRevisionId();
-    const outputPath = await writeTranslation(root, chapter, result.text, mode === "refine", selected.partial ? segmentId : `ai-${revisionId}`);
-    const adopted = await withBookMutation(bookId, async () => {
-      data = await readLibrary(); book = data.books.find((item) => item.id === bookId); chapter = book?.chapters.find((item) => item.id === chapterId);
-      if (!chapter) return false;
-      chapter.revisionHistory ||= [];
-      if (!selected.partial && (chapter.revisionId || null) !== startingRevisionId) {
-        chapter.revisionHistory.push({ id: revisionId, path: outputPath, origin: "ai", createdAt: new Date().toISOString(), reason: "AI 完成时读者已有新版本；未自动采用" });
-        await saveLibrary(data);
-        return false;
-      }
-      if (selected.partial) {
-        chapter.segments ||= []; chapter.segments.unshift({ id: segmentId, label: selected.label, range: selected.range, source: selected.source, translationPath: outputPath, status: "review", createdAt: new Date().toISOString(), usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens, estimatedCost: result.estimatedCost }, lastModel: provider.model });
-      } else {
-        if (mode === "refine") chapter.polishedPath = outputPath; else chapter.translationPath = outputPath;
-        chapter.status = "review";
-        chapter.draftOrigin = existingDraft && mode === "refine" && chapter.draftOrigin === "reader" ? "reader" : "ai";
-        chapter.revisionId = revisionId;
-        chapter.exportedAt = null;
-        chapter.revisionHistory.push({ id: revisionId, path: outputPath, origin: chapter.draftOrigin, createdAt: new Date().toISOString(), reason: mode === "refine" ? "AI 精校" : "AI 初译" });
-      }
-      chapter.updatedAt = new Date().toISOString(); chapter.usage ||= { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
-      chapter.usage.inputTokens += result.inputTokens; chapter.usage.outputTokens += result.outputTokens; chapter.usage.estimatedCost += result.estimatedCost;
-      chapter.lastModel = provider.model; await saveLibrary(data); await syncProjectState(book);
-      return true;
-    });
-    if (!adopted) { await updateTask(task.id, { detail: `${chapter.title} · AI 译稿已留存为历史版本；读者修改未覆盖` }); return; }
-    if (mode === "draft" && !selected.partial) {
+    } catch (error) { run.error = error.message; await persistRun(control.cancelled ? "cancelled" : "failed"); throw error; }
+    // Analysis is a separate, cancellable stage; it never replaces the adopted reader revision.
+    if (mode === "draft" && !selected.partial && run.adopted) {
       try {
-        const analysis = await analyzeChapterEntities({ provider, book, chapter, source: selected.source });
-        await storeChapterAnalysis(bookId, chapterId, analysis, provider.model);
+        checkControl(control); const analysis = await analyzeChapterEntities({ provider, book, chapter, source: selected.source, signal: control.signal });
+        checkControl(control); await withBookMutation(bookId, async () => { checkControl(control); await storeChapterAnalysis(bookId, chapterId, analysis, provider.model); });
         const settings = await readSearchSettings();
         const risks = identifyHighRisk({ source: selected.source, draft: result.text, analysis, glossary: book.glossary || [], characters: book.characters || [] }).slice(0, settings.autoItemsPerChapter);
         const autoChecks = [];
         for (const risk of risks) {
-          const researched = await verifyIssue({ book, item: { japanese: risk.originalTerm, disambiguator: risk.disambiguator, chinese: risk.proposed, chapter: chapter.title }, kind: "term", apiKey: settings.apiKey, budget: searchBudget, provider, requestsPerItem: settings.requestsPerItem });
-          const autoRevised = await maybeAutoReviseChapter({ bookId, chapterId, source: selected.source, provider, risk, research: researched });
-          autoChecks.push({ ...risk, verdict: researched.verdict, reason: researched.reason || "", sources: researched.sources || [], researchedAt: researched.searchedAt, autoRevised });
+          await waitControl(control);
+          const research = await verifyIssue({ book, item: { japanese: risk.originalTerm, disambiguator: risk.disambiguator, chinese: risk.proposed, chapter: chapter.title }, kind: "term", apiKey: settings.apiKey, budget: searchBudget, provider, signal: control.signal, requestsPerItem: settings.requestsPerItem });
+          checkControl(control);
+          const autoRevised = await maybeAutoReviseChapter({ bookId, chapterId, source: selected.source, provider, risk, research, control });
+          autoChecks.push({ ...risk, verdict: research.verdict, reason: research.reason || "", sources: research.sources || [], researchedAt: research.searchedAt, autoRevised });
         }
         await withBookMutation(bookId, async () => {
-          const latest = await readLibrary(); const current = latest.books.find((entry) => entry.id === bookId)?.chapters.find((entry) => entry.id === chapterId);
-          if (current) { current.quality = { analyzedAt: new Date().toISOString(), autoChecks, unresolved: autoChecks.filter((entry) => entry.verdict !== "supported").length }; await saveLibrary(latest); }
+          checkControl(control); const latest = await readLibrary(); const current = latest.books.find((b) => b.id === bookId)?.chapters.find((c) => c.id === chapterId);
+          if (current) { current.quality = { analyzedAt: new Date().toISOString(), autoChecks, unresolved: autoChecks.filter((c) => c.verdict !== "supported").length }; await saveLibrary(latest); }
         });
       } catch (error) {
-        await withBookMutation(bookId, async () => {
-          const latest = await readLibrary(); const current = latest.books.find((entry) => entry.id === bookId)?.chapters.find((entry) => entry.id === chapterId);
-          if (current) { current.analysisError = `初译已保存，术语分析暂不可用：${error.message}`; await saveLibrary(latest); }
-        });
+        if (control.cancelled) throw error;
+        await withBookMutation(bookId, async () => { const latest = await readLibrary(); const current = latest.books.find((b) => b.id === bookId)?.chapters.find((c) => c.id === chapterId); if (current) { current.analysisError = `译文已保存，注释分析未完成：${error.message}`; await saveLibrary(latest); } });
       }
     }
-  });
+  }, { chapterId, mode, range: range || { type: "whole" }, engine });
 }
 async function storeChapterAnalysis(bookId, chapterId, result, model) {
   return withBookMutation(bookId, async () => {
@@ -403,38 +472,41 @@ async function storeChapterAnalysis(bookId, chapterId, result, model) {
     return { book: targetBook, chapter: targetChapter };
   });
 }
-async function maybeAutoReviseChapter({ bookId, chapterId, source, provider, risk, research }) {
+async function maybeAutoReviseChapter({ bookId, chapterId, source, provider, risk, research, control = {} }) {
   const snapshot = await readLibrary(); const book = snapshot.books.find((entry) => entry.id === bookId); const chapter = book?.chapters.find((entry) => entry.id === chapterId);
   if (!chapter || !canAutoReviseFromEvidence(chapter, research) || research.suggestedChinese === risk.proposed) return false;
   const expectedRevisionId = chapter.revisionId;
-  const polished = Boolean(chapter.polishedPath);
-  const existingDraft = await readChapterText(bookRoot(book), chapter, polished ? "polished" : "translation");
+  const polished = /[\\/]polished[\\/]/.test(activeRevisionPath(chapter));
+  const existingDraft = await readChapterText(bookRoot(book), chapter, "current");
   let revised;
   try {
-    revised = await translateChapter({ provider, book, chapter, source, existingDraft, mode: "refine", correction: { originalTerm: risk.originalTerm, currentChinese: risk.proposed, suggestedChinese: research.suggestedChinese, evidence: research.sources.map((entry) => `${entry.title || entry.url}：${entry.excerpt}`).join("；").slice(0, 1500) }, control: { paused: false, cancelled: false } });
+    revised = await translateChapter({ provider, book, chapter, source, existingDraft, mode: "refine", correction: { originalTerm: risk.originalTerm, currentChinese: risk.proposed, suggestedChinese: research.suggestedChinese, evidence: research.sources.map((entry) => `${entry.title || entry.url}：${entry.excerpt}`).join("；").slice(0, 1500) }, control });
   } catch { return false; }
   if (!revised.text.includes(research.suggestedChinese) || revised.text.includes(risk.proposed)) return false;
   return withBookMutation(bookId, async () => {
     const latest = await readLibrary(); const currentBook = latest.books.find((entry) => entry.id === bookId); const current = currentBook?.chapters.find((entry) => entry.id === chapterId);
+    checkControl(control);
     if (!canAutoRevise(current, expectedRevisionId)) return false;
     const revisionId = newRevisionId();
-    const outputPath = await writeTranslation(bookRoot(currentBook), current, revised.text, polished, `verified-${revisionId}`);
+    const outputPath = await writeTranslation(bookRoot(currentBook), current, revised.text, polished, `verified-${revisionId}`, control.signal);
+    checkControl(control);
     if (polished) current.polishedPath = outputPath; else current.translationPath = outputPath;
-    current.revisionId = revisionId; current.updatedAt = new Date().toISOString();
+    current.revisionId = revisionId; current.activeRevisionId = revisionId; current.updatedAt = new Date().toISOString();
     current.revisionHistory ||= [];
-    current.revisionHistory.push({ id: revisionId, path: outputPath, origin: "ai", createdAt: current.updatedAt, reason: `AI 联网纠正 ${risk.originalTerm}：${risk.proposed} → ${research.suggestedChinese}`, sources: research.sources });
+    current.revisionHistory.push({ id: revisionId, path: outputPath, origin: "ai", createdAt: current.updatedAt, segments: revised.segments, reason: `AI 联网纠正 ${risk.originalTerm}：${risk.proposed} → ${research.suggestedChinese}`, sources: research.sources });
     await saveLibrary(latest); await syncProjectState(currentBook);
     return true;
   });
 }
 async function analyzeBookChapter(bookId, chapterId) {
-  return startTask(bookId, "术语人物分析", chapterId, async (task) => {
+  return startTask(bookId, "术语人物分析", chapterId, async (task, control) => {
     const data = await readLibrary(); const book = data.books.find((item) => item.id === bookId); const chapter = book?.chapters.find((item) => item.id === chapterId);
     if (!chapter) throw new Error("章节不存在");
     const source = await readChapterText(bookRoot(book), chapter, "source"); if (!source.trim()) throw new Error("本章没有可分析的原文");
     await updateTask(task.id, { progress: 12, detail: `${chapter.title} · 正在识别术语、人名和疑难点` });
     const provider = await readProvider();
-    const result = await analyzeChapterEntities({ provider, book, chapter, source });
+    const result = await analyzeChapterEntities({ provider, book, chapter, source, signal: control.signal });
+    checkControl(control);
     await storeChapterAnalysis(bookId, chapterId, result, provider.model);
     await updateTask(task.id, { progress: 96, detail: `${chapter.title} · 找到 ${result.terms.length} 个术语、${result.characters.length} 个人名、${result.uncertainties.length} 个疑难点` });
   });
@@ -459,11 +531,23 @@ async function upload(req, res, url) {
   const book = { id, title: url.searchParams.get("title") || original.replace(extension, ""), author: url.searchParams.get("author") || "", format: extension.slice(1).toUpperCase(), profile: url.searchParams.get("profile") || "自动判断", sourceLanguage: selectedLanguage, demo: false, sourceFile: join("source", original), createdAt: new Date().toISOString(), chapters: [{ id: `${id}-pending`, title: "等待章节识别", status: "not_started", source: "文件已安全导入，尚未执行提取。", translation: "", paragraphCount: 0 }], glossary: [], characters: [], uncertainties: [], tasks: [{ id: `task-${Date.now()}`, type: "书籍导入", status: "completed", progress: 100, detail: original }] };
   await initializeProject(join(LIBRARY, id), book, book.sourceFile); data.books.unshift(book);
   await saveLibrary(data);
-  json(res, 201, { id, title: data.books[0].title });
+  const task = await extractBookTask(id);
+  json(res, 201, { id, title: book.title, taskId: task.id });
 }
 
 async function api(req, res, url) {
-  if (req.method === "GET" && url.pathname === "/api/health") return json(res, 200, { ok: true });
+  if (req.method === "GET" && url.pathname === "/api/health") return json(res, 200, { ok: true, pid: process.pid, shutdown: true, readerProtocol: 1, consoleAttached: Boolean(process.stdout.isTTY) });
+  if (req.method === "GET" && url.pathname === "/api/lifecycle") {
+    const data = await readLibrary();
+    return json(res, 200, { state: stopping ? "stopping" : "running", activeTasks: data.books.flatMap((book) => book.tasks || []).filter((task) => ["queued", "running", "paused"].includes(task.status)).length });
+  }
+  if (req.method === "POST" && url.pathname === "/api/shutdown") {
+    if (!String(req.headers["content-type"] || "").startsWith("application/json") || (await readJson(req)).confirm !== true) return json(res, 400, { error: "请在工作台确认关闭后台" });
+    await beginShutdown();
+    res.once("finish", finishShutdown);
+    json(res, 200, { ok: true });
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/search-settings") return json(res, 200, await publicSearchSettings(await readSearchSettings()));
   if (req.method === "PUT" && url.pathname === "/api/search-settings") return json(res, 200, await saveSearchSettings(await readJson(req)));
   if (req.method === "POST" && url.pathname === "/api/search-settings/test") {
@@ -477,11 +561,21 @@ async function api(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/provider") return json(res, 200, publicProvider(await readProvider()));
   if (req.method === "PUT" && url.pathname === "/api/provider") return json(res, 200, await saveProvider(await readJson(req)));
-  if (req.method === "POST" && url.pathname === "/api/provider/test") return json(res, 200, await testProviderConnection(await readProvider()));
+  if (req.method === "POST" && url.pathname === "/api/provider/models") { const provider = await providerForRequest(await readJson(req)); return json(res, 200, await discoverProviderModels(provider, true)); }
+  if (req.method === "POST" && url.pathname === "/api/provider/probe") { const provider = await providerForRequest(await readJson(req)); return json(res, 200, usesOpenCodeServer(provider) ? await probeOpenCodeServer(provider) : await probeCli(provider.backend, provider.cliPath)); }
+  if (req.method === "POST" && url.pathname === "/api/provider/test") {
+    const body = await readJson(req); const previous = await readProvider();
+    const sameOrigin = !body.baseUrl || new URL(body.baseUrl).origin === new URL(previous.baseUrl).origin;
+    const candidate = { ...previous, ...body, ...openCodeSettings(body, previous), apiKey: body.clearKey ? "" : body.apiKey || (sameOrigin ? previous.apiKey : "") };
+    if (candidate.backend && candidate.backend !== "http") validateCliChoice(candidate, candidate.reasoningEffort ? await discoverProviderModels(candidate) : null);
+    const result = await testProviderConnection(candidate);
+    if (body.save) await saveProvider(body);
+    return json(res, 200, result);
+  }
   if (req.method === "GET" && url.pathname === "/api/library") return json(res, 200, await readLibrary());
   if (req.method === "DELETE" && url.pathname === "/api/tasks" && url.searchParams.get("finished") === "1") {
     const data = await readLibrary(); let deleted = 0;
-    for (const book of data.books) { const before = (book.tasks || []).length; book.tasks = (book.tasks || []).filter((task) => ["running", "paused"].includes(task.status)); deleted += before - book.tasks.length; }
+    for (const book of data.books) { const before = (book.tasks || []).length; book.tasks = (book.tasks || []).filter((task) => ["queued", "running", "paused"].includes(task.status)); deleted += before - book.tasks.length; }
     await saveLibrary(data); return json(res, 200, { deleted });
   }
   const taskDeleteMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
@@ -489,7 +583,7 @@ async function api(req, res, url) {
     const data = await readLibrary();
     for (const book of data.books) {
       const index = (book.tasks || []).findIndex((task) => task.id === taskDeleteMatch[1]); if (index < 0) continue;
-      if (["running", "paused"].includes(book.tasks[index].status)) return json(res, 409, { error: "运行中或暂停的任务不能删除，请先取消" });
+      if (["queued", "running", "paused"].includes(book.tasks[index].status)) return json(res, 409, { error: "运行中或暂停的任务不能删除，请先取消" });
       book.tasks.splice(index, 1); await saveLibrary(data); return json(res, 200, { deleted: true });
     }
     return json(res, 404, { error: "任务不存在" });
@@ -515,34 +609,55 @@ async function api(req, res, url) {
     const data = await readLibrary(); const index = data.books.findIndex((item) => item.id === bookMatch[1]); if (index < 0) return json(res, 404, { error: "作品不存在" });
     const book = data.books[index]; const target = resolve(bookRoot(book)); const allowedRoot = `${resolve(LIBRARY)}${sep}`;
     if (!target.startsWith(allowedRoot)) throw new Error("作品目录不在书库范围内，已停止删除");
-    for (const task of book.tasks || []) { const control = taskControls.get(task.id); if (control) control.cancelled = true; }
+    for (const task of book.tasks || []) { const control = taskControls.get(task.id); if (control) { control.cancelled = true; control.controller.abort(); } }
     let trashedTo = "";
     if (existsSync(target)) { const trash = join(LIBRARY, ".trash"); await mkdir(trash, { recursive: true }); trashedTo = join(trash, `${book.id}-${Date.now()}`); await rename(target, trashedTo); }
     data.books.splice(index, 1);
     try { await saveLibrary(data); } catch (error) { if (trashedTo) await rename(trashedTo, target).catch(() => {}); throw error; }
     return json(res, 200, { deleted: true, recoverable: Boolean(trashedTo), title: book.title });
   }
+  const searchMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/search$/);
+  if (req.method === "GET" && searchMatch) {
+    const query = (url.searchParams.get("q") || "").trim().slice(0, 120).toLocaleLowerCase();
+    const book = (await readLibrary()).books.find((b) => b.id === searchMatch[1]); if (!book) return json(res, 404, { error: "作品不存在" });
+    const results = [];
+    if (query) for (const chapter of book.chapters) {
+      const source = await readChapterText(bookRoot(book), chapter, "source"); const paragraphs = sourceParagraphs(source, chapter.id);
+      const translated = revisionSegments(chapter) || [{ text: await readChapterText(bookRoot(book), chapter, "current"), sourceParagraphIds: [] }];
+      for (const part of [...paragraphs.map((p) => ({ text: p.text, sourceParagraphIds: [p.id] })), ...translated]) {
+        const index = part.text.toLocaleLowerCase().indexOf(query); if (index < 0) continue;
+        results.push({ chapterId: chapter.id, title: chapter.title, paragraphId: part.sourceParagraphIds[0] || null, snippet: part.text.slice(Math.max(0, index - 30), index + query.length + 70) });
+        if (results.length >= 50) break;
+      }
+      if (results.length >= 50) break;
+    }
+    return json(res, 200, results);
+  }
   const chapterMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)$/);
   if (req.method === "GET" && chapterMatch) {
     const data = await readLibrary(); const book = data.books.find((item) => item.id === chapterMatch[1]); const chapter = book?.chapters.find((item) => item.id === chapterMatch[2]);
     if (!chapter) return json(res, 404, { error: "章节不存在" });
-    const root = bookRoot(book); const source = await readChapterText(root, chapter, "source"); const translation = await readChapterText(root, chapter, chapter.polishedPath ? "polished" : "translation");
+    const root = bookRoot(book); const source = await readChapterText(root, chapter, "source"); const translation = await readChapterText(root, chapter, "current");
     const segments = [];
     for (const segment of chapter.segments || []) {
       let segmentTranslation = "";
       try { segmentTranslation = await readFile(join(root, segment.translationPath), "utf8"); } catch { /* keep missing segment visible */ }
       segments.push({ ...segment, translation: segmentTranslation });
     }
-    return json(res, 200, { ...chapter, source, translation, segments });
+    const paragraphs = sourceParagraphs(source, chapter.id);
+    const aligned = revisionSegments(chapter);
+    const validAlignment = aligned && JSON.stringify(aligned.flatMap((s) => s.sourceParagraphIds)) === JSON.stringify(paragraphs.map((p) => p.id));
+    return json(res, 200, { ...chapter, source, sourceParagraphs: paragraphs, translation, alignedSegments: validAlignment ? aligned : null, alignmentStatus: validAlignment ? "aligned" : translation ? "legacy" : "pending", segments });
   }
   if (req.method === "PATCH" && chapterMatch) {
     return withBookMutation(chapterMatch[1], async () => {
     const body = await readJson(req); const data = await readLibrary(); const book = data.books.find((item) => item.id === chapterMatch[1]); const chapter = book?.chapters.find((item) => item.id === chapterMatch[2]);
     if (!chapter) return json(res, 404, { error: "章节不存在" });
     if (!book.demo && body.translation !== undefined) {
-      const polished = Boolean(chapter.polishedPath); const revisionId = newRevisionId(); const savedPath = await writeTranslation(bookRoot(book), chapter, body.translation, polished, `reader-${revisionId}`);
+      await preserveExistingRevision(bookRoot(book), chapter);
+      const polished = /[\\/]polished[\\/]/.test(activeRevisionPath(chapter)); const revisionId = newRevisionId(); const savedPath = await writeTranslation(bookRoot(book), chapter, body.translation, polished, `reader-${revisionId}`);
       if (polished) chapter.polishedPath = savedPath; else chapter.translationPath = savedPath;
-      chapter.draftOrigin = "reader"; chapter.revisionId = revisionId; chapter.exportedAt = null;
+      chapter.draftOrigin = "reader"; chapter.revisionId = revisionId; chapter.activeRevisionId = revisionId; chapter.exportedAt = null;
       chapter.revisionHistory ||= []; chapter.revisionHistory.push({ id: revisionId, path: savedPath, origin: "reader", createdAt: new Date().toISOString(), reason: "读者修改" });
     } else if (body.translation !== undefined) chapter.translation = body.translation;
     Object.assign(chapter, { status: body.status ?? chapter.status, updatedAt: new Date().toISOString() }); await saveLibrary(data); await syncProjectState(book); return json(res, 200, { ...chapter, translation: body.translation });
@@ -557,12 +672,12 @@ async function api(req, res, url) {
     if (!target.startsWith(`${root}${sep}`) || !existsSync(target)) return json(res, 409, { error: "历史译稿文件不可用，未进行恢复" });
     if (selected.path.replaceAll("\\", "/").includes("/polished/")) chapter.polishedPath = selected.path;
     else { chapter.translationPath = selected.path; chapter.polishedPath = ""; }
-    chapter.draftOrigin = "reader"; chapter.exportedAt = null; chapter.status = "review"; chapter.revisionId = newRevisionId(); chapter.updatedAt = new Date().toISOString();
-    chapter.revisionHistory.push({ id: chapter.revisionId, path: selected.path, origin: "reader", createdAt: chapter.updatedAt, reason: `读者恢复版本 ${selected.id}` });
+    chapter.draftOrigin = "reader"; chapter.exportedAt = null; chapter.status = "review"; chapter.revisionId = newRevisionId(); chapter.activeRevisionId = chapter.revisionId; chapter.updatedAt = new Date().toISOString();
+    chapter.revisionHistory.push({ id: chapter.revisionId, path: selected.path, segments: selected.segments || null, origin: "reader", createdAt: chapter.updatedAt, reason: `读者恢复版本 ${selected.id}` });
     await saveLibrary(data); await syncProjectState(book); return json(res, 200, chapter);
   });
   const translateMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/translate$/);
-  if (req.method === "POST" && translateMatch) { const body = await readJson(req); return json(res, 202, await translateBookChapter(translateMatch[1], translateMatch[2], body.mode === "refine" ? "refine" : "draft", body.range || { type: "whole" })); }
+  if (req.method === "POST" && translateMatch) { const body = await readJson(req); return json(res, 202, await translateBookChapter(translateMatch[1], translateMatch[2], body.mode === "refine" ? "refine" : "draft", body.range || { type: "whole" }, Boolean(body.retry))); }
   const analyzeMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/analyze$/);
   if (req.method === "POST" && analyzeMatch) return json(res, 202, await analyzeBookChapter(analyzeMatch[1], analyzeMatch[2]));
   const segmentMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/segments\/([^/]+)$/);
@@ -590,8 +705,8 @@ async function api(req, res, url) {
   const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/(pause|resume|cancel)$/);
   if (req.method === "POST" && taskMatch) {
     const control = taskControls.get(taskMatch[1]); if (!control) return json(res, 409, { error: "任务当前不在运行；应用重启后的任务请重新发起" });
-    const action = taskMatch[2]; if (action === "pause") control.paused = true; if (action === "resume") control.paused = false; if (action === "cancel") control.cancelled = true;
-    const status = action === "pause" ? "paused" : action === "resume" ? "running" : "cancelled"; return json(res, 200, await updateTask(taskMatch[1], { status }));
+    const action = taskMatch[2]; if (action === "pause") control.paused = true; if (action === "resume") control.paused = false; if (action === "cancel") { control.cancelled = true; control.controller.abort(); }
+    const status = action === "pause" ? "paused" : action === "resume" ? (control.started ? "running" : "queued") : "cancelled"; return json(res, 200, await updateTask(taskMatch[1], { status }));
   }
   const researchMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/research\/(term|character|glossary|characters|uncertainty)\/([^/]+)$/);
   if (req.method === "DELETE" && researchMatch) {
@@ -614,11 +729,13 @@ async function api(req, res, url) {
     const settings = await readSearchSettings();
     const research = await verifyIssue({ book, item, kind, apiKey: settings.apiKey, budget: searchBudget, provider: await readProvider(), requestsPerItem: settings.requestsPerItem });
     research.searchedAt ||= new Date().toISOString();
+    return withBookMutation(bookId, async () => {
     const fresh = await readLibrary(); const currentBook = fresh.books.find((entry) => entry.id === bookId);
     const currentItem = (currentBook?.[listName] || []).find((entry) => entry.id === itemId);
     if (!currentItem) return json(res, 409, { error: "考证期间该条目已被修改，请刷新后重试" });
     currentItem.research = research; currentItem.verification = research.verdict === "supported" ? "资料支持" : research.verdict === "conflicted" ? "资料冲突" : research.verdict === "unavailable" ? "搜索不可用" : "证据不足";
     await saveLibrary(fresh); return json(res, 200, research);
+    });
   }
   const glossaryMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/glossary$/);
   if (req.method === "POST" && glossaryMatch) {
@@ -694,13 +811,14 @@ async function api(req, res, url) {
         let translation = ""; try { translation = await readFile(join(bookRoot(book), segment.translationPath), "utf8"); } catch { /* skipped by exporter */ }
         hydrated.push({ ...segment, id: segment.id, title: `${chapter.title} · ${segment.label}`, translation, status: "approved" });
       }
-    } else for (const chapter of book.chapters) if (!body.chapterIds?.length || body.chapterIds.includes(chapter.id)) hydrated.push({ ...chapter, source: await readChapterText(bookRoot(book), chapter, "source"), translation: await readChapterText(bookRoot(book), chapter, chapter.polishedPath ? "polished" : "translation") });
+    } else for (const chapter of book.chapters) if (!body.chapterIds?.length || body.chapterIds.includes(chapter.id)) hydrated.push({ ...chapter, source: await readChapterText(bookRoot(book), chapter, "source"), translation: await readChapterText(bookRoot(book), chapter, "current") });
     const selectionSuffix = body.selectionOnly ? "selections" : body.chapterIds?.length ? "selected" : (body.includeDraft ? "draft" : "approved");
-    const filename = hydrated.length === 1 ? `${safeName(hydrated[0].title)}${body.includeDraft ? "-草稿" : ""}.epub` : `${safeName(book.title)}-${selectionSuffix}.epub`; const outputPath = join(EXPORTS, filename);
+    const exportId = `export-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
+    const filename = hydrated.length === 1 ? `${safeName(hydrated[0].title)}${body.includeDraft ? "-草稿" : ""}-${exportId}.epub` : `${safeName(book.title)}-${selectionSuffix}-${exportId}.epub`; const outputPath = join(EXPORTS, filename);
     const result = await createEpub({ book, chapters: hydrated, outputPath, includeDraft: Boolean(body.includeDraft) });
     const included = new Set(result.chapterIds);
     if (!body.selectionOnly) for (const chapter of book.chapters) if (included.has(chapter.id)) chapter.exportedAt = new Date().toISOString();
-    data.exports.unshift({ id: `export-${Date.now()}`, bookId: book.id, bookTitle: book.title, filename, chapterCount: result.chapterCount, createdAt: new Date().toISOString(), includesDraft: Boolean(body.includeDraft) }); await saveLibrary(data);
+    data.exports.unshift({ id: exportId, bookId: book.id, bookTitle: book.title, filename, chapterCount: result.chapterCount, createdAt: new Date().toISOString(), includesDraft: Boolean(body.includeDraft) }); await saveLibrary(data);
     return json(res, 200, { ...result, downloadUrl: `/api/exports/${encodeURIComponent(filename)}` });
     });
   }
@@ -714,10 +832,15 @@ async function api(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const host = req.headers.host;
-  if (!new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]).has(host) || (req.headers.origin && req.headers.origin !== `http://${host}`)) return json(res, 403, { error: "仅接受本机页面请求" });
+  if (!new Set([`127.0.0.1:${server.address().port}`, `localhost:${server.address().port}`]).has(host) || (req.headers.origin && req.headers.origin !== `http://${host}`)) return json(res, 403, { error: "仅接受本机页面请求" });
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   try {
-    if (url.pathname.startsWith("/api/")) return await api(req, res, url);
+    if (stopping) return json(res, 503, { error: "后台正在关闭，请重新启动后再操作" });
+    if (url.pathname.startsWith("/api/")) {
+      const deferred = url.pathname === "/api/shutdown" || /^\/api\/tasks\/[^/]+\/(pause|resume|cancel)$/.test(url.pathname) || (req.method === "POST" && /\/(translate|extract|analyze|research|test|probe|models)(\/|$)/.test(url.pathname));
+      if (req.method !== "GET" && !deferred) return await withBookMutation(null, () => api(req, res, url));
+      return await api(req, res, url);
+    }
     const requested = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
     const path = normalize(join(PUBLIC, requested));
     if (!path.startsWith(PUBLIC) || !existsSync(path)) { res.writeHead(404); return res.end("Not found"); }
@@ -726,4 +849,44 @@ const server = http.createServer(async (req, res) => {
   } catch (error) { console.error(error); json(res, 500, { error: error.message || "服务器错误" }); }
 });
 
-server.listen(PORT, "127.0.0.1", () => console.log(`翻译书库已启动：http://127.0.0.1:${PORT}`));
+function beginShutdown() {
+  if (shutdownPromise) return shutdownPromise;
+  stopping = true;
+  console.log("正在关闭后台，保存已完成进度并停止任务…");
+  server.close();
+  shutdownDeadline = setTimeout(() => { console.error("退出等待超时；已保存的块将在下次启动时恢复。"); process.exit(1); }, 9000);
+  shutdownDeadline.unref();
+  shutdownPromise = mutationContext.run(false, async () => {
+    for (const control of taskControls.values()) { control.cancelled = true; control.paused = false; control.controller.abort(new Error("后台已关闭；已完成块保留")); }
+    await Promise.all([stopChildProcesses(), stopOpenCodeSessions()]);
+    await taskQueue;
+    await withBookMutation(null, async () => {
+      const data = await readLibrary(); let changed = false;
+      for (const book of data.books) for (const task of book.tasks || []) {
+        if (!["queued", "running", "paused"].includes(task.status)) continue;
+        task.status = "cancelled"; task.error = "后台已关闭；已完成块保留"; changed = true;
+        const chapter = book.chapters?.find((c) => c.translationRun?.id === task.id);
+        if (chapter?.translationRun?.status === "running") chapter.translationRun.status = "cancelled";
+      }
+      if (changed) await saveLibrary(data);
+    });
+    await libraryWriteQueue;
+    const pidFile = join(ROOT, ".server.pid");
+    try { if (Number((await readFile(pidFile, "utf8")).trim()) === process.pid) await unlink(pidFile); } catch { /* this server may not use the launcher */ }
+  });
+  return shutdownPromise;
+}
+function finishShutdown() {
+  clearTimeout(shutdownDeadline); server.closeAllConnections();
+  console.log("后台已关闭。书籍和已完成进度已保留。");
+  setTimeout(() => process.exit(0), 50);
+}
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", ...(process.platform === "win32" ? ["SIGBREAK"] : [])]) process.on(signal, () => {
+  beginShutdown().then(finishShutdown).catch((error) => { console.error(error); process.exit(1); });
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  process.title = "瀟湘館后台 · 运行中";
+  console.log(`翻译书库已启动：http://127.0.0.1:${server.address().port}`);
+  console.log("此窗口是瀟湘館后台。最小化可继续运行；在工作台点击“关闭后台”、按 Ctrl+C 或关闭本窗口即可退出。关闭浏览器页面不会停止后台。");
+});
