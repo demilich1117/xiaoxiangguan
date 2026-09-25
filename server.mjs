@@ -2,7 +2,7 @@ import { discoverCliModels, validateCliChoice } from "./lib/cli-models.mjs";
 import { probeCli } from "./lib/cli-provider.mjs";
 import { OpenCodeServer, usesOpenCodeServer, discoverOpenCodeServerModels, probeOpenCodeServer, stopOpenCodeSessions } from "./lib/opencode-server.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { sourceParagraphs, sourceFingerprint, revisionSegments } from "./lib/alignment.mjs";
+import { sourceParagraphs, sourceFingerprint, revisionSegments, DEFAULT_TRANSLATION_BLOCK_CHARS, validateTranslationBlockChars } from "./lib/alignment.mjs";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync } from "node:fs";
@@ -71,7 +71,7 @@ async function saveLibrary(data) {
 }
 function json(res, status, payload) { res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }); res.end(JSON.stringify(payload)); }
 function safeName(value) { return basename(value).replace(/[^\p{L}\p{N}._ -]/gu, "-").slice(0, 160) || "book"; }
-const providerDefaults = { backend: "http", cliPath: "", reasoningEffort: "", timeoutMs: 300000, opencodeMode: "cli", opencodeServerUrl: "http://127.0.0.1:4096", opencodeDirectory: ROOT, opencodeUsername: "opencode", providerName: "OpenAI · Luna", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", model: "gpt-6-luna", maxOutputTokens: 8192, inputPrice: 0.1, outputPrice: 0.5, noAuth: false };
+const providerDefaults = { backend: "http", cliPath: "", reasoningEffort: "", timeoutMs: 300000, translationBlockChars: DEFAULT_TRANSLATION_BLOCK_CHARS, opencodeMode: "cli", opencodeServerUrl: "http://127.0.0.1:4096", opencodeDirectory: ROOT, opencodeUsername: "opencode", providerName: "OpenAI · Luna", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", model: "gpt-6-luna", maxOutputTokens: 8192, inputPrice: 0.1, outputPrice: 0.5, noAuth: false };
 const searchDefaults = { dailyLimit: 30, autoItemsPerChapter: 3, requestsPerItem: 2 };
 let searchDailyLimit = 30;
 const searchBudget = createSearchBudget({ file: join(DATA, "search-usage.json"), cacheFile: SEARCH_CACHE_FILE, dailyLimit: () => searchDailyLimit });
@@ -91,6 +91,7 @@ async function readProvider() {
   delete stored.apiKeyProtected; delete stored.apiKey;
   if (!stored.providerName && !stored.baseUrl && !stored.model) return { ...providerDefaults, apiKey };
   const merged = { ...providerDefaults, ...stored, apiKey, opencodePassword };
+  merged.translationBlockChars = validateTranslationBlockChars(merged.translationBlockChars);
   for (const key of ["providerName", "baseUrl", ...(!merged.backend || merged.backend === "http" ? ["model"] : [])]) if (!merged[key]) merged[key] = providerDefaults[key];
   return merged;
 }
@@ -163,6 +164,7 @@ async function saveProvider(body) {
   const next = {
     ...openCodeSettings(body, existing),
     backend, reasoningEffort: String(body.reasoningEffort ?? existing.reasoningEffort ?? ""), cliPath: String(body.cliPath ?? existing.cliPath ?? "").trim(), timeoutMs: Math.max(1000, Math.min(1800000, Number(body.timeoutMs || existing.timeoutMs || 300000))),
+    translationBlockChars: validateTranslationBlockChars(body.translationBlockChars === undefined ? existing.translationBlockChars : body.translationBlockChars),
     providerName: String(body.providerName ?? existing.providerName).trim(), protocol, baseUrl,
     model: String(body.model ?? existing.model).trim(),
     maxOutputTokens: Math.min(131072, Math.max(256, Number(body.maxOutputTokens || existing.maxOutputTokens || 8192))),
@@ -368,6 +370,7 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
   if (provider.backend && provider.backend !== "http") validateCliChoice(provider, provider.reasoningEffort ? await discoverProviderModels(provider) : null);
   const engine = { reasoningEffort: provider.reasoningEffort || "", backend: provider.backend || "http", protocol: provider.protocol, model: provider.model, baseUrl: provider.baseUrl, maxOutputTokens: provider.maxOutputTokens, inputPrice: provider.inputPrice, outputPrice: provider.outputPrice, cliPath: provider.cliPath || "" };
   if (usesOpenCodeServer(provider)) Object.assign(engine, { opencodeMode: "server", opencodeServerUrl: provider.opencodeServerUrl, opencodeDirectory: provider.opencodeDirectory });
+  engine.translationBlockChars = provider.translationBlockChars;
   return startTask(bookId, mode === "refine" ? "译文精校" : "章节翻译", `${chapterId} · ${rangeLabel}`, async (task, control) => {
     let data = await readLibrary(); let book = data.books.find((i) => i.id === bookId); let chapter = book?.chapters.find((i) => i.id === chapterId); if (!chapter) throw new Error("章节不存在");
     const root = bookRoot(book); const fullSource = await readChapterText(root, chapter, "source"); if (!fullSource.trim()) throw new Error("本章没有可翻译原文");
@@ -383,7 +386,10 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
     const previousText = previous ? await readChapterText(root, previous, "current") : "";
     if (mode === "refine" && !existingDraft.trim()) throw new Error("请先完成本章初译");
     const oldRun = chapter.translationRun;
-    const compatible = oldRun && oldRun.fingerprint === fingerprint && oldRun.mode === mode && oldRun.baseRevisionId === startingRevisionId && JSON.stringify(oldRun.engine) === JSON.stringify(engine) && oldRun.partial === selected.partial && JSON.stringify(oldRun.range) === JSON.stringify(selected.range || { type: "whole" });
+    // Older runs used 6500 characters. Resume with the original boundaries even after settings change.
+    const previousEngine = oldRun && { ...oldRun.engine, translationBlockChars: oldRun.engine?.translationBlockChars ?? 6500 };
+    if (retry && previousEngine) engine.translationBlockChars = provider.translationBlockChars = previousEngine.translationBlockChars;
+    const compatible = oldRun && oldRun.fingerprint === fingerprint && oldRun.mode === mode && oldRun.baseRevisionId === startingRevisionId && JSON.stringify(previousEngine) === JSON.stringify(engine) && oldRun.partial === selected.partial && JSON.stringify(oldRun.range) === JSON.stringify(selected.range || { type: "whole" });
     if (retry && !compatible) throw new Error("原文、当前版本或引擎已变化，请重新开始翻译");
     const run = { id: task.id, mode, partial: selected.partial, range: selected.range || { type: "whole" }, fingerprint, baseRevisionId: startingRevisionId, engine, blocks: retry && compatible ? oldRun.blocks.filter((b) => b.status === "completed") : [], status: "running" };
     await withBookMutation(bookId, async () => {

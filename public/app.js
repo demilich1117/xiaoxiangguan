@@ -580,6 +580,8 @@ async function renderSettings() {
       <label class="check-row"><input id="provider-no-auth" type="checkbox" ${providerSettings.noAuth ? "checked" : ""}/> 本机接口不需要 API 密钥</label>
       <label class="check-row"><input id="clear-provider-key" type="checkbox"/> 清除当前已保存的密钥</label>
       </details></div>
+      <label>每块原文目标字符数<input id="provider-block-chars" type="number" min="500" max="6000" step="1" required value="${providerSettings.translationBlockChars ?? 3000}" aria-describedby="provider-block-hint"/></label>
+      <p id="provider-block-hint">默认 3000，可设为 500–6000；CLI 较慢时可调小。初译与精校均适用，保留完整段落，超长单段或精校合并段可能超过此值。保存后用于新任务；继续未完成任务沿用原分块。</p>
       <div id="provider-key-notice" class="notice">密钥只发送给你填写的 API 地址，网页不会重新显示完整密钥。${protectionText} 配置位于本机 <code>secrets</code> 目录；不要把该目录发给他人。</div>
       <div id="provider-test-result" class="notice hidden"></div>
       <div class="dialog-actions"><button id="test-provider" type="button">测试并保存</button><button class="primary" type="submit">保存引擎配置</button></div>
@@ -666,6 +668,7 @@ async function testSearchSettings() {
 }
 
 async function testProviderSettings() {
+  if (!document.querySelector("#provider-form").reportValidity()) return;
   const button = document.querySelector("#test-provider"); const resultBox = document.querySelector("#provider-test-result");
   button.disabled = true; button.textContent = "正在测试…"; resultBox.classList.add("hidden");
   try {
@@ -712,6 +715,7 @@ function cliConnectionPayload() {
 function providerPayload() {
   const payload = { providerName: document.querySelector("#provider-name").value, protocol: document.querySelector("#provider-protocol").value, baseUrl: document.querySelector("#provider-url").value, model: document.querySelector("#provider-model").value, maxOutputTokens: Number(document.querySelector("#provider-max-output").value), inputPrice: Number(document.querySelector("#provider-input-price").value), outputPrice: Number(document.querySelector("#provider-output-price").value), apiKey: document.querySelector("#provider-key").value, noAuth: document.querySelector("#provider-no-auth").checked, clearKey: document.querySelector("#clear-provider-key").checked };
   Object.assign(payload, cliConnectionPayload());
+  payload.translationBlockChars = Number(document.querySelector("#provider-block-chars").value);
   payload.reasoningEffort = document.querySelector("#provider-effort").value;
   if (payload.backend !== "http") { payload.model = document.querySelector("#provider-cli-model").value.trim(); payload.providerName = payload.backend === "opencode" && payload.opencodeMode === "server" ? "OpenCode 本地服务" : `${payload.backend} CLI`; }
   return payload;

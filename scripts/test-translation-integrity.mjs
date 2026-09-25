@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 import { translateChapter } from "../lib/engine.mjs";
-import { sourceParagraphs, validateSegments } from "../lib/alignment.mjs";
+import { sourceParagraphs, validateSegments, translationBlocks } from "../lib/alignment.mjs";
 import { generate } from "../lib/providers.mjs";
 
 const storage = await mkdtemp(join(tmpdir(), "xxg-integrity-"));
@@ -32,6 +32,18 @@ try {
   mode = "truncated";
   for (const protocol of ["openai-chat", "openai-responses"]) await assert.rejects(generate({ provider: { ...provider, protocol }, messages: [{ role: "user", content: "test" }] }), /未完整结束/);
   mode = "normal";
+  const smallSource = ["A", "B", "C", "D"].map((text) => text.repeat(700)).join("\n\n");
+  const smallParagraphs = sourceParagraphs(smallSource, "sized");
+  const smallDrafts = smallParagraphs.map((p, i) => ({ sourceParagraphIds: [p.id], text: `小段译文${i}` }));
+  for (const [translationBlockChars, expectedCalls] of [[undefined, 1], [500, 4], [1000, 4], [2000, 2], [3000, 1], [5000, 1], [6000, 1]]) {
+    for (const translationMode of ["draft", "refine"]) {
+      requests = [];
+      const result = await translateChapter({ provider: { ...provider, translationBlockChars }, book: {}, chapter: { id: "sized" }, source: smallSource, mode: translationMode, draftSegments: smallDrafts });
+      assert.equal(requests.length, expectedCalls, "configured size drives draft and refinement calls");
+      assert.deepEqual(result.segments.flatMap((s) => s.sourceParagraphIds), smallParagraphs.map((p) => p.id), "smaller blocks preserve complete source coverage");
+    }
+  }
+  await assert.rejects(translateChapter({ provider: { ...provider, translationBlockChars: 2000 }, book: {}, chapter: {}, source: smallSource, mode: "refine", existingDraft: "旧译文" }), /超过当前分块大小/);
   const source = ["A".repeat(4000), "B".repeat(4000), "C".repeat(4000)].join("\n\n");
   const paragraphs = sourceParagraphs(source, "alignment");
   const draftSegments = paragraphs.map((p, i) => ({ sourceParagraphIds: [p.id], text: ["译文甲", "译文乙", "译文丙"][i].repeat(250) }));
@@ -58,7 +70,7 @@ try {
   for (const dir of ["data", "secrets", "library/book/state", "library/other-book/state"]) await mkdir(join(storage, dir), { recursive: true });
   await writeFile(join(storage, "secrets/provider.json"), JSON.stringify(provider));
   await writeFile(join(storage, "library/book/old.md"), "旧精校版");
-  const chapters = ["version", "cancel", "reader", "progress", "restart"].map((id) => ({ id, title: id, source: ["progress", "restart"].includes(id) ? source : "Source paragraph.", status: "review", ...(id === "version" ? { polishedPath: "old.md" } : {}) }));
+  const chapters = ["version", "cancel", "reader", "progress", "restart", "sized", "queued-size"].map((id) => ({ id, title: id, source: ["progress", "restart"].includes(id) ? source : ["sized", "queued-size"].includes(id) ? smallSource : "Source paragraph.", status: "review", ...(id === "version" ? { polishedPath: "old.md" } : {}) }));
   await writeFile(join(storage, "data/library.json"), JSON.stringify({ books: [{ id: "book", title: "fixture", chapters, tasks: [], glossary: [], characters: [], uncertainties: [] }, { id: "other-book", title: "other", chapters: [], tasks: [] }], exports: [] }));
   const boot = async () => {
   child = spawn(process.execPath, ["server.mjs"], { cwd: new URL("../", import.meta.url), env: { ...process.env, PORT: "0", TRANSLATION_LIBRARY_DATA_DIR: storage }, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -74,6 +86,34 @@ try {
   const chapter = (id) => api(`/api/books/book/chapters/${id}`);
   const start = (id, body = {}) => api(`/api/books/book/chapters/${id}/translate`, "POST", body);
   const finish = async (id) => { for (let i = 0; i < 150; i++) { const task = (await api("/api/library")).books[0].tasks.find((t) => t.id === id); if (["completed", "failed", "cancelled"].includes(task.status)) return task; await sleep(40); } throw new Error("task timeout"); };
+  assert.equal((await api("/api/provider")).translationBlockChars, 3000, "existing configurations inherit the new default");
+  for (const invalid of [null, "", 0, 499, 6001, 10000, 1000.5, "invalid"]) {
+    const response = await fetch(base + "/api/provider", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ translationBlockChars: invalid }) });
+    assert.equal(response.ok, false); assert.match((await response.json()).error, /500 到 6000/);
+    assert.equal((await api("/api/provider")).translationBlockChars, 3000, "invalid saves leave the prior value intact");
+  }
+  for (const backend of ["codex", "opencode", "antigravity", "http"]) {
+    const saved = await api("/api/provider", "PUT", { backend, model: backend === "opencode" ? "vendor/mock" : "mock", noAuth: true, translationBlockChars: 1500 });
+    assert.equal(saved.translationBlockChars, 1500);
+    assert.equal((await api("/api/provider")).translationBlockChars, 1500, "all backends persist and return block size");
+  }
+  assert.equal((await api("/api/provider", "PUT", { noAuth: true })).translationBlockChars, 1500, "older clients can omit the setting");
+  assert.equal((await api("/api/provider", "PUT", { noAuth: true, translationBlockChars: 6000 })).translationBlockChars, 6000, "the upper limit is accepted");
+  await api("/api/provider", "PUT", { noAuth: true, translationBlockChars: 2000 });
+  mode = "after-one"; generatedCount = 0;
+  const sizedPending = new Promise((r) => { arrived = r; }); const sizedTask = await start("sized"); await sizedPending;
+  const queuedSize = await start("queued-size"); assert.equal(queuedSize.status, "queued");
+  await api("/api/provider", "PUT", { noAuth: true, translationBlockChars: 1000 });
+  mode = "normal"; await api(`/api/tasks/${sizedTask.id}/cancel`, "POST"); release();
+  assert.equal((await finish(queuedSize.id)).status, "completed");
+  assert.equal((await chapter("queued-size")).translationRun.engine.translationBlockChars, 2000, "queued tasks freeze their block size");
+  assert.equal((await chapter("queued-size")).translationRun.blocks.length, 2);
+  requests = []; const sizedRetry = await start("sized", { retry: true });
+  assert.equal((await finish(sizedRetry.id)).status, "completed");
+  assert.equal(requests.filter((text) => text.includes("原文段落")).length, 1, "changed settings do not retranslate completed blocks on resume");
+  assert.equal((await chapter("sized")).translationRun.engine.translationBlockChars, 2000);
+  const newSizedTask = await start("sized"); assert.equal((await finish(newSizedTask.id)).status, "completed");
+  assert.equal((await chapter("sized")).translationRun.blocks.length, 4, "new tasks use the changed setting");
   const version = await start("version"); assert.equal((await finish(version.id)).status, "completed");
   const current = await chapter("version"); assert.match(current.translation, /新译文/); assert.equal(current.revisionHistory.length, 2); assert.ok(current.activeRevisionId);
   const exported = await api("/api/books/book/export/epub", "POST", { includeDraft: true, chapterIds: ["version"] });
@@ -102,13 +142,22 @@ try {
   mode = "after-one"; generatedCount = 0; pending = new Promise((r) => { arrived = r; });
   const interrupted = await start("restart"); await pending;
   child.kill("SIGKILL"); await once(child, "exit"); release(); mode = "normal";
+  // Emulate a pre-setting run, which did not record its fixed 6500-character size.
+  const restartLibrary = JSON.parse(await readFile(join(storage, "data/library.json"), "utf8"));
+  const oldChapter = restartLibrary.books[0].chapters.find((c) => c.id === "restart");
+  const oldParagraphs = sourceParagraphs(oldChapter.source, "restart");
+  assert.equal(translationBlocks(oldParagraphs, null, 6500).length, 3);
+  delete oldChapter.translationRun.engine.translationBlockChars;
+  await writeFile(join(storage, "data/library.json"), JSON.stringify(restartLibrary));
   base = await boot();
+  assert.equal((await api("/api/provider")).translationBlockChars, 1000, "block setting survives restart");
   const recovered = await chapter("restart");
   assert.equal((await finish(interrupted.id)).status, "failed");
   assert.equal(recovered.translationRun.status, "failed");
   assert.equal(recovered.translationRun.blocks.filter((b) => b.status === "completed").length, 1);
   requests = []; const continued = await start("restart", { retry: true });
   assert.equal((await finish(continued.id)).status, "completed");
+  assert.equal((await chapter("restart")).translationRun.engine.translationBlockChars, 6500, "pre-setting runs retain their historical boundaries");
   assert.equal(requests.filter((text) => text.includes("原文段落")).length, 2, "restart recovery reuses durable blocks");
   console.log("F1–F4, ID alignment, merged/missing/duplicate paragraphs, resumable blocks and restart recovery, immutable exports and reader protection passed");
 } finally {
