@@ -1,5 +1,6 @@
 import { discoverCliModels, validateCliChoice } from "./lib/cli-models.mjs";
 import { probeCli } from "./lib/cli-provider.mjs";
+import { OpenCodeServer, usesOpenCodeServer, discoverOpenCodeServerModels, probeOpenCodeServer, stopOpenCodeSessions } from "./lib/opencode-server.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { sourceParagraphs, sourceFingerprint, revisionSegments } from "./lib/alignment.mjs";
 import http from "node:http";
@@ -70,7 +71,7 @@ async function saveLibrary(data) {
 }
 function json(res, status, payload) { res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }); res.end(JSON.stringify(payload)); }
 function safeName(value) { return basename(value).replace(/[^\p{L}\p{N}._ -]/gu, "-").slice(0, 160) || "book"; }
-const providerDefaults = { backend: "http", cliPath: "", reasoningEffort: "", timeoutMs: 300000, providerName: "OpenAI · Luna", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", model: "gpt-6-luna", maxOutputTokens: 8192, inputPrice: 0.1, outputPrice: 0.5, noAuth: false };
+const providerDefaults = { backend: "http", cliPath: "", reasoningEffort: "", timeoutMs: 300000, opencodeMode: "cli", opencodeServerUrl: "http://127.0.0.1:4096", opencodeDirectory: ROOT, opencodeUsername: "opencode", providerName: "OpenAI · Luna", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", model: "gpt-6-luna", maxOutputTokens: 8192, inputPrice: 0.1, outputPrice: 0.5, noAuth: false };
 const searchDefaults = { dailyLimit: 30, autoItemsPerChapter: 3, requestsPerItem: 2 };
 let searchDailyLimit = 30;
 const searchBudget = createSearchBudget({ file: join(DATA, "search-usage.json"), cacheFile: SEARCH_CACHE_FILE, dailyLimit: () => searchDailyLimit });
@@ -85,9 +86,11 @@ async function readProvider() {
   if (!existsSync(PROVIDER_FILE)) return { ...providerDefaults };
   const stored = JSON.parse(await readFile(PROVIDER_FILE, "utf8"));
   const apiKey = stored.apiKeyProtected ? await secretOperation("Unprotect", stored.apiKeyProtected) : (stored.apiKey || "");
+  const opencodePassword = stored.opencodePasswordProtected ? await secretOperation("Unprotect", stored.opencodePasswordProtected) : (stored.opencodePassword || "");
+  delete stored.opencodePasswordProtected; delete stored.opencodePassword;
   delete stored.apiKeyProtected; delete stored.apiKey;
   if (!stored.providerName && !stored.baseUrl && !stored.model) return { ...providerDefaults, apiKey };
-  const merged = { ...providerDefaults, ...stored, apiKey };
+  const merged = { ...providerDefaults, ...stored, apiKey, opencodePassword };
   for (const key of ["providerName", "baseUrl", ...(!merged.backend || merged.backend === "http" ? ["model"] : [])]) if (!merged[key]) merged[key] = providerDefaults[key];
   return merged;
 }
@@ -124,8 +127,23 @@ async function saveSearchSettings(body) {
   return publicSearchSettings({ ...next, apiKey });
 }
 function publicProvider(settings) {
-  const { apiKey, apiKeyProtected, ...safe } = settings;
-  return { ...safe, hasApiKey: Boolean(apiKey), keyHint: apiKey ? `••••${apiKey.slice(-4)}` : "" };
+  const { apiKey, apiKeyProtected, opencodePassword, opencodePasswordProtected, ...safe } = settings;
+  return { ...safe, hasApiKey: Boolean(apiKey), keyHint: apiKey ? `••••${apiKey.slice(-4)}` : "", hasOpenCodePassword: Boolean(opencodePassword), supportsOpenCodeServer: true };
+}
+function openCodeSettings(body, existing) {
+  const next = Object.fromEntries(["opencodeMode", "opencodeServerUrl", "opencodeDirectory", "opencodeUsername"].map((key) => [key, String(body[key] ?? existing[key] ?? providerDefaults[key]).trim()]));
+  next.opencodeServerUrl = next.opencodeServerUrl.replace(/\/+$/, "");
+  if (!["cli", "server"].includes(next.opencodeMode)) throw new Error("不支持的 OpenCode 连接方式");
+  const sameServer = next.opencodeServerUrl === existing.opencodeServerUrl && next.opencodeUsername === existing.opencodeUsername;
+  next.opencodePassword = body.clearOpenCodePassword ? "" : String(body.opencodePassword || "") || (sameServer ? existing.opencodePassword || "" : "");
+  return next;
+}
+async function providerForRequest(body) {
+  const existing = await readProvider();
+  return { ...existing, ...body, ...openCodeSettings(body, existing) };
+}
+async function discoverProviderModels(provider, refresh = false) {
+  return usesOpenCodeServer(provider) ? discoverOpenCodeServerModels(provider) : discoverCliModels(provider.backend, provider.cliPath, refresh);
 }
 async function saveProvider(body) {
   const existing = await readProvider();
@@ -143,6 +161,7 @@ async function saveProvider(body) {
   const nextOrigin = (() => { try { return new URL(baseUrl).origin; } catch { return ""; } })();
   const providerChanged = Boolean(previousOrigin && nextOrigin && previousOrigin !== nextOrigin);
   const next = {
+    ...openCodeSettings(body, existing),
     backend, reasoningEffort: String(body.reasoningEffort ?? existing.reasoningEffort ?? ""), cliPath: String(body.cliPath ?? existing.cliPath ?? "").trim(), timeoutMs: Math.max(1000, Math.min(1800000, Number(body.timeoutMs || existing.timeoutMs || 300000))),
     providerName: String(body.providerName ?? existing.providerName).trim(), protocol, baseUrl,
     model: String(body.model ?? existing.model).trim(),
@@ -153,11 +172,16 @@ async function saveProvider(body) {
     apiKey: incomingKey || (body.clearKey || providerChanged ? "" : (existing.apiKey || "")), updatedAt: new Date().toISOString()
   };
   if (backend !== "http") {
-    const catalog = next.reasoningEffort ? await discoverCliModels(backend, next.cliPath) : null;
+    if (usesOpenCodeServer(next)) new OpenCodeServer(next);
+    const catalog = next.reasoningEffort ? await discoverProviderModels(next) : null;
     validateCliChoice(next, catalog);
   }
   const temp = `${PROVIDER_FILE}.tmp`;
-  const { apiKey, ...stored } = next;
+  const { apiKey, opencodePassword, ...stored } = next;
+  if (opencodePassword) {
+    try { stored.opencodePasswordProtected = await secretOperation("Protect", opencodePassword); stored.opencodePasswordProtection = "windows-dpapi"; }
+    catch { stored.opencodePassword = opencodePassword; stored.opencodePasswordProtection = "local-file-fallback"; }
+  } else stored.opencodePasswordProtection = "none";
   if (apiKey) {
     try { stored.apiKeyProtected = await secretOperation("Protect", apiKey); stored.keyProtection = "windows-dpapi"; }
     catch { stored.apiKey = apiKey; stored.keyProtection = "local-file-fallback"; }
@@ -341,8 +365,9 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
   const rangeLabel = range?.type === "paragraphs" ? `第 ${range.start}–${range.end} 段` : range?.type === "pages" ? `PDF 第 ${range.start}–${range.end} 页` : "整章";
   // Freeze configuration when queued; never persist API keys in task or block metadata.
   const provider = await readProvider();
-  if (provider.backend && provider.backend !== "http") validateCliChoice(provider, provider.reasoningEffort ? await discoverCliModels(provider.backend, provider.cliPath) : null);
+  if (provider.backend && provider.backend !== "http") validateCliChoice(provider, provider.reasoningEffort ? await discoverProviderModels(provider) : null);
   const engine = { reasoningEffort: provider.reasoningEffort || "", backend: provider.backend || "http", protocol: provider.protocol, model: provider.model, baseUrl: provider.baseUrl, maxOutputTokens: provider.maxOutputTokens, inputPrice: provider.inputPrice, outputPrice: provider.outputPrice, cliPath: provider.cliPath || "" };
+  if (usesOpenCodeServer(provider)) Object.assign(engine, { opencodeMode: "server", opencodeServerUrl: provider.opencodeServerUrl, opencodeDirectory: provider.opencodeDirectory });
   return startTask(bookId, mode === "refine" ? "译文精校" : "章节翻译", `${chapterId} · ${rangeLabel}`, async (task, control) => {
     let data = await readLibrary(); let book = data.books.find((i) => i.id === bookId); let chapter = book?.chapters.find((i) => i.id === chapterId); if (!chapter) throw new Error("章节不存在");
     const root = bookRoot(book); const fullSource = await readChapterText(root, chapter, "source"); if (!fullSource.trim()) throw new Error("本章没有可翻译原文");
@@ -536,13 +561,13 @@ async function api(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/provider") return json(res, 200, publicProvider(await readProvider()));
   if (req.method === "PUT" && url.pathname === "/api/provider") return json(res, 200, await saveProvider(await readJson(req)));
-  if (req.method === "POST" && url.pathname === "/api/provider/models") { const body = await readJson(req); return json(res, 200, await discoverCliModels(body.backend, body.cliPath, true)); }
-  if (req.method === "POST" && url.pathname === "/api/provider/probe") { const body = await readJson(req); return json(res, 200, await probeCli(body.backend, body.cliPath)); }
+  if (req.method === "POST" && url.pathname === "/api/provider/models") { const provider = await providerForRequest(await readJson(req)); return json(res, 200, await discoverProviderModels(provider, true)); }
+  if (req.method === "POST" && url.pathname === "/api/provider/probe") { const provider = await providerForRequest(await readJson(req)); return json(res, 200, usesOpenCodeServer(provider) ? await probeOpenCodeServer(provider) : await probeCli(provider.backend, provider.cliPath)); }
   if (req.method === "POST" && url.pathname === "/api/provider/test") {
     const body = await readJson(req); const previous = await readProvider();
     const sameOrigin = !body.baseUrl || new URL(body.baseUrl).origin === new URL(previous.baseUrl).origin;
-    const candidate = { ...previous, ...body, apiKey: body.clearKey ? "" : body.apiKey || (sameOrigin ? previous.apiKey : "") };
-    if (candidate.backend && candidate.backend !== "http") validateCliChoice(candidate, candidate.reasoningEffort ? await discoverCliModels(candidate.backend, candidate.cliPath) : null);
+    const candidate = { ...previous, ...body, ...openCodeSettings(body, previous), apiKey: body.clearKey ? "" : body.apiKey || (sameOrigin ? previous.apiKey : "") };
+    if (candidate.backend && candidate.backend !== "http") validateCliChoice(candidate, candidate.reasoningEffort ? await discoverProviderModels(candidate) : null);
     const result = await testProviderConnection(candidate);
     if (body.save) await saveProvider(body);
     return json(res, 200, result);
@@ -833,7 +858,7 @@ function beginShutdown() {
   shutdownDeadline.unref();
   shutdownPromise = mutationContext.run(false, async () => {
     for (const control of taskControls.values()) { control.cancelled = true; control.paused = false; control.controller.abort(new Error("后台已关闭；已完成块保留")); }
-    await stopChildProcesses();
+    await Promise.all([stopChildProcesses(), stopOpenCodeSessions()]);
     await taskQueue;
     await withBookMutation(null, async () => {
       const data = await readLibrary(); let changed = false;

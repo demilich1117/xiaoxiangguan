@@ -554,7 +554,19 @@ async function renderSettings() {
     <form class="panel panel-pad settings-form" id="provider-form">
       <div class="section-head settings-head"><div><h2>翻译引擎 <span class="default-badge">翻译与注释</span></h2><p>选择 API 或已安装的 CLI；翻译、精校与注释使用同一引擎。</p></div>${configured ? '<span class="status approved">已配置</span>' : '<span class="status review">待配置</span>'}</div>
       <label>引擎<select id="provider-backend">${["http", "codex", "opencode", "antigravity"].map((id) => `<option value="${id}" ${id === (providerSettings.backend || "http") ? "selected" : ""}>${{ http: "翻译 API", codex: "Codex CLI", opencode: "OpenCode CLI", antigravity: "Antigravity CLI" }[id]}</option>`).join("")}</select></label>
-      <div id="cli-settings"><label>可执行文件路径（留空自动检测）<input id="provider-cli-path" value="${escapeAttribute(providerSettings.cliPath || "")}" placeholder="原生 CLI 可执行文件的绝对路径"/></label><label>模型<select id="provider-cli-model-select"><option value="">CLI 默认模型</option><option value="__manual">手动填写模型 ID</option></select></label><label id="manual-cli-model">模型 ID（OpenCode 使用 provider/model）<input id="provider-cli-model" value="${escapeAttribute(providerSettings.backend !== "http" ? providerSettings.model || "" : "")}"/></label><label>推理强度<select id="provider-effort"><option value="">默认强度</option></select></label><button type="button" id="load-cli-models">读取模型与强度</button><p id="cli-model-hint">读取本机模型目录后，可选择对应的强度。</p><button type="button" id="probe-cli">检测安装</button><p id="cli-probe-result" role="status">登录状态尚未验证；使用 CLI 已有登录，测试成功后确认可用。</p></div>
+      <div id="cli-settings">
+      <label id="opencode-mode-label">OpenCode 连接方式<select id="opencode-mode"><option value="cli" ${providerSettings.opencodeMode !== "server" ? "selected" : ""}>直接调用 CLI</option><option value="server" ${providerSettings.opencodeMode === "server" ? "selected" : ""} ${providerSettings.supportsOpenCodeServer ? "" : "disabled"}>连接本地服务 · 在桌面端查看会话</option></select></label>
+      <p id="opencode-mode-notice">当前后台尚未加载本地服务接入，请关闭并重新启动瀟湘館后台后使用。</p>
+      <div id="opencode-server-settings">
+        <p>工作台与 OpenCode 桌面端请选择同一服务，并打开相同项目目录。生成的分段会话会保留在该目录下。</p>
+        <label>本地服务地址<input id="opencode-server-url" value="${escapeAttribute(providerSettings.opencodeServerUrl || "http://127.0.0.1:4096")}" placeholder="http://127.0.0.1:4096"/></label>
+        <label>固定项目目录<input id="opencode-directory" value="${escapeAttribute(providerSettings.opencodeDirectory || "")}" placeholder="桌面端打开的本机目录绝对路径"/></label>
+        <label>服务用户名<input id="opencode-username" value="${escapeAttribute(providerSettings.opencodeUsername || "opencode")}" autocomplete="off"/></label>
+        <label>服务密码（未设置认证时留空）<input id="opencode-password" type="password" autocomplete="new-password" placeholder="${providerSettings.hasOpenCodePassword ? "已保存；留空保持，更换服务或用户名后需重新填写" : "与 OpenCode 服务的密码一致"}"/></label>
+        <label class="check-row"><input type="checkbox" id="clear-opencode-password"/>清除已保存的服务密码</label>
+        <p>可在终端运行 <code>opencode serve --hostname 127.0.0.1 --port 4096</code> 启动服务。取消翻译只停止对应会话；关闭工作台后台后，共用服务仍可供桌面端使用。</p>
+      </div>
+      <label id="cli-path-label">可执行文件路径（留空自动检测）<input id="provider-cli-path" value="${escapeAttribute(providerSettings.cliPath || "")}" placeholder="原生 CLI 可执行文件的绝对路径"/></label><label>模型<select id="provider-cli-model-select"><option value="">引擎默认模型</option><option value="__manual">手动填写模型 ID</option></select></label><label id="manual-cli-model">模型 ID（OpenCode 使用 provider/model）<input id="provider-cli-model" value="${escapeAttribute(providerSettings.backend !== "http" ? providerSettings.model || "" : "")}"/></label><label>推理强度<select id="provider-effort"><option value="">默认强度</option></select></label><button type="button" id="load-cli-models">读取模型与强度</button><p id="cli-model-hint">读取本机模型目录后，可选择对应的强度。</p><button type="button" id="probe-cli">检测安装</button><p id="cli-probe-result" role="status">登录状态尚未验证；使用引擎已有登录，测试成功后确认可用。</p></div>
       <div id="http-settings"><label class="preset-picker">服务商与模型<select id="provider-preset">${presetOptions}<option value="custom" ${selectedPreset === "custom" ? "selected" : ""}>自定义 · OpenAI 兼容接口</option></select></label>
       <div class="preset-note" id="preset-note"></div>
       <label>翻译 API 密钥<input id="provider-key" type="password" autocomplete="new-password" placeholder="${providerSettings.hasApiKey ? `已保存 ${escapeHtml(providerSettings.keyHint)}；留空则保持不变` : "粘贴 API Key"}"/></label>
@@ -601,23 +613,33 @@ async function renderSettings() {
   modelSelect.value = modelInput.value ? "__manual" : "";
   modelSelect.onchange = () => { if (modelSelect.value !== "__manual") modelInput.value = modelSelect.value; else modelInput.value = ""; updateEffort(); };
   modelInput.oninput = () => updateEffort();
-  const updateBackend = () => { const cli = backendSelect.value !== "http"; document.querySelector("#cli-settings").hidden = !cli; document.querySelector("#http-settings").hidden = cli; document.querySelector("#provider-key-notice").hidden = cli; }; updateBackend(); updateEffort();
+  const updateBackend = () => {
+    const cli = backendSelect.value !== "http", opencode = backendSelect.value === "opencode", server = opencode && document.querySelector("#opencode-mode").value === "server";
+    document.querySelector("#cli-settings").hidden = !cli; document.querySelector("#http-settings").hidden = cli; document.querySelector("#provider-key-notice").hidden = cli;
+    document.querySelector("#opencode-mode-label").hidden = !opencode; document.querySelector("#opencode-server-settings").hidden = !server; document.querySelector("#cli-path-label").hidden = server;
+    document.querySelector("#opencode-mode-notice").hidden = !opencode || Boolean(providerSettings.supportsOpenCodeServer);
+    document.querySelector("#probe-cli").textContent = server ? "检测服务与目录" : "检测安装";
+  }; updateBackend(); updateEffort();
   backendSelect.onchange = () => { document.querySelector("#provider-cli-path").value = ""; document.querySelector("#cli-model-hint").textContent = "读取本机模型目录后，可选择对应的强度。"; document.querySelector("#cli-probe-result").textContent = "登录状态尚未验证；使用 CLI 已有登录，测试成功后确认可用。"; modelCatalog = []; modelInput.value = ""; modelSelect.innerHTML = '<option value="">CLI 默认模型</option><option value="__manual">手动填写模型 ID</option>'; updateBackend(); updateEffort(); };
+  for (const id of ["opencode-mode", "opencode-server-url", "opencode-directory", "opencode-username", "opencode-password", "clear-opencode-password", "provider-cli-path"]) document.getElementById(id).addEventListener("change", () => {
+    modelCatalog = []; modelSelect.innerHTML = '<option value="">引擎默认模型</option><option value="__manual">手动填写模型 ID</option>'; modelSelect.value = modelInput.value ? "__manual" : ""; updateEffort(); updateBackend();
+    document.querySelector("#cli-model-hint").textContent = "连接配置已变化，请重新读取模型与强度。"; document.querySelector("#cli-probe-result").textContent = "连接配置尚未检测。";
+  });
   document.querySelector("#load-cli-models").onclick = async () => {
-    const button = document.querySelector("#load-cli-models"), hint = document.querySelector("#cli-model-hint"); const backend = backendSelect.value;
+    const button = document.querySelector("#load-cli-models"), hint = document.querySelector("#cli-model-hint"); const connection = JSON.stringify(cliConnectionPayload());
     button.disabled = true; hint.textContent = "正在读取本机模型目录…";
     try {
-      const result = await request("/api/provider/models", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ backend, cliPath: document.querySelector("#provider-cli-path").value }) });
-      if (backend !== backendSelect.value) return;
+      const result = await request("/api/provider/models", { method: "POST", headers: { "content-type": "application/json" }, body: connection });
+      if (connection !== JSON.stringify(cliConnectionPayload())) return;
       modelCatalog = result.models; const selected = modelInput.value;
       modelSelect.innerHTML = '<option value="">CLI 默认模型</option>' + modelCatalog.map((m) => `<option value="${escapeAttribute(m.id)}">${escapeHtml(m.name)}</option>`).join("") + '<option value="__manual">手动填写模型 ID</option>';
       modelSelect.value = modelCatalog.some((m) => m.id === selected) ? selected : selected ? "__manual" : "";
-      updateEffort(backend === providerSettings.backend && selected === providerSettings.model ? providerSettings.reasoningEffort : "");
+      updateEffort(backendSelect.value === providerSettings.backend && selected === providerSettings.model ? providerSettings.reasoningEffort : "");
       hint.textContent = `${modelCatalog.length} 个模型 · ${result.hint}`;
-    } catch (e) { hint.textContent = e.message; } finally { button.disabled = false; }
+    } catch (e) { if (connection === JSON.stringify(cliConnectionPayload())) hint.textContent = e.message; } finally { button.disabled = false; }
   };
   if (providerSettings.backend && providerSettings.backend !== "http") document.querySelector("#load-cli-models").click();
-  document.querySelector("#probe-cli").onclick = async () => { const box = document.querySelector("#cli-probe-result"); box.textContent = "正在检测…"; try { const result = await request("/api/provider/probe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ backend: document.querySelector("#provider-backend").value, cliPath: document.querySelector("#provider-cli-path").value }) }); box.textContent = result.error || `${result.version || "已安装"} · 登录状态需测试确认`; } catch (e) { box.textContent = e.message; } };
+  document.querySelector("#probe-cli").onclick = async () => { const box = document.querySelector("#cli-probe-result"), connection = JSON.stringify(cliConnectionPayload()); box.textContent = "正在检测…"; try { const result = await request("/api/provider/probe", { method: "POST", headers: { "content-type": "application/json" }, body: connection }); if (connection !== JSON.stringify(cliConnectionPayload())) return; box.textContent = result.error || (result.mode === "server" ? `OpenCode ${result.version} · 服务可连接，项目目录匹配；模型调用需测试确认` : `${result.version || "已安装"} · 登录状态需测试确认`); } catch (e) { if (connection === JSON.stringify(cliConnectionPayload())) box.textContent = e.message; } };
   document.querySelector("#provider-preset").addEventListener("change", applyProviderPreset);
   document.querySelector("#provider-key").addEventListener("input", (event) => { if (event.target.value) document.querySelector("#clear-provider-key").checked = false; });
   document.querySelector("#test-provider").addEventListener("click", testProviderSettings);
@@ -682,12 +704,16 @@ function applyProviderPreset(event) {
   updatePresetNote();
 }
 
+function cliConnectionPayload() {
+  return { backend: document.querySelector("#provider-backend").value, cliPath: document.querySelector("#provider-cli-path").value,
+    opencodeMode: document.querySelector("#opencode-mode").value, opencodeServerUrl: document.querySelector("#opencode-server-url").value, opencodeDirectory: document.querySelector("#opencode-directory").value,
+    opencodeUsername: document.querySelector("#opencode-username").value, opencodePassword: document.querySelector("#opencode-password").value, clearOpenCodePassword: document.querySelector("#clear-opencode-password").checked };
+}
 function providerPayload() {
   const payload = { providerName: document.querySelector("#provider-name").value, protocol: document.querySelector("#provider-protocol").value, baseUrl: document.querySelector("#provider-url").value, model: document.querySelector("#provider-model").value, maxOutputTokens: Number(document.querySelector("#provider-max-output").value), inputPrice: Number(document.querySelector("#provider-input-price").value), outputPrice: Number(document.querySelector("#provider-output-price").value), apiKey: document.querySelector("#provider-key").value, noAuth: document.querySelector("#provider-no-auth").checked, clearKey: document.querySelector("#clear-provider-key").checked };
-  payload.backend = document.querySelector("#provider-backend").value;
+  Object.assign(payload, cliConnectionPayload());
   payload.reasoningEffort = document.querySelector("#provider-effort").value;
-  payload.cliPath = document.querySelector("#provider-cli-path").value;
-  if (payload.backend !== "http") { payload.model = document.querySelector("#provider-cli-model").value.trim(); payload.providerName = `${payload.backend} CLI`; }
+  if (payload.backend !== "http") { payload.model = document.querySelector("#provider-cli-model").value.trim(); payload.providerName = payload.backend === "opencode" && payload.opencodeMode === "server" ? "OpenCode 本地服务" : `${payload.backend} CLI`; }
   return payload;
 }
 async function saveProviderSettings(event) {

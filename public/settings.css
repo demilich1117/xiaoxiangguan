@@ -7,7 +7,7 @@
 .storage-panel code { display: block; padding: 10px 12px; overflow-wrap: anywhere; color: var(--blue); background: var(--surface-soft); }
 .lifecycle-panel { order: 4; }
 .storage-panel p:last-child { margin-bottom: 0; color: var(--muted); font-size: 13px; }
-.settings-form > label, #http-settings > label, #cli-settings > label {
+.settings-form > label, #http-settings > label, #cli-settings > label, #opencode-server-settings > label {
   display: grid;
   gap: 7px;
   color: var(--muted);
@@ -15,6 +15,7 @@
   margin-top: 16px;
 }
 .settings-head { margin-top: 0; }
+.settings-head > .status { flex-shrink: 0; white-space: nowrap; }
 .settings-help h3 { margin: 0 0 12px; }
 .check-row {
   display: flex !important;
@@ -24,6 +25,8 @@
   gap: 8px !important;
 }
 .check-row input { width: auto; }
+#opencode-server-settings { margin: 16px 0; padding: 4px 16px 12px; border-left: 2px solid var(--line); background: var(--surface-soft); }
+#opencode-server-settings p { font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }
 .settings-form code { font-family: Consolas, monospace; }
 .hidden { display: none !important; }
 .preset-picker select { font-weight: 650; }

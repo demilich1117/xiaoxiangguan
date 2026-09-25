@@ -41,6 +41,8 @@ Windows 可双击 start-library.cmd 启动，会打开网页和一个“瀟湘�
 
 安装并登录后，在设置中选择引擎、点击“检测安装”和“读取模型与强度”。模型列表来自本机 CLI，使用账号实际可用的模型；可保留 CLI 默认模型，也可手动填写模型 ID。OpenCode 模型 ID 使用 `provider/model` 格式，本轮验证的是 1.x CLI。
 
+要在 OpenCode 桌面端查看翻译过程，可把 OpenCode 连接方式改为“连接本地服务”。先运行 `opencode serve --hostname 127.0.0.1 --port 4096`，工作台和桌面端连接同一个地址，并打开同一个固定项目目录。分段会话按书名、章节命名；取消只中止对应会话，关闭工作台不会停止共用服务。模型与强度从服务读取，不需要 MCP。完整步骤见 [桌面端查看会话](docs/cli-setup.md#在-opencode-桌面端查看翻译会话)。
+
 | 引擎 | 模型与强度来源 |
 | --- | --- |
 | Codex | `app-server` 的 `model/list`；每个模型的 `supportedReasoningEfforts` |
