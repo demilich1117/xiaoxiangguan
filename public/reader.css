@@ -1,4 +1,9 @@
 /* One owner for application navigation and the parallel reading surface. */
+:root {
+  --reader-font-latin: "Noto Serif Variable", "Georgia", serif;
+  --reader-font-japanese: "Noto Serif JP Variable", "Yu Mincho", "Hiragino Mincho ProN", "MS PMincho", serif;
+  --reader-font-chinese: "Noto Serif SC Variable", "Source Han Serif SC", "Songti SC", "SimSun", serif;
+}
 [hidden] { display: none !important; }
 .app-shell { min-height: 100dvh; display: grid; grid-template-columns: 172px minmax(0, 1fr); }
 .sidebar { display: flex; flex-direction: column; position: sticky; top: 0; height: 100dvh; padding: 24px 12px; border-right: 1px solid var(--line); background: var(--paper); }
@@ -38,7 +43,8 @@
 .reading-toolbar button, .reading-page-head button, .reading-progress button { font-size: 13px; padding: 6px 12px; min-height: 40px; white-space: nowrap; }
 .reading-title { flex: 1; min-width: 120px; padding: 0 12px; }
 .reading-title small { display: block; color: var(--reader-muted); font-size: 12px; }
-.reading-title strong { display: block; font: 600 20px/1.5 "SimSun", "Songti SC", serif; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.reading-title strong { display: block; font: 600 20px/1.5 var(--reader-font-latin); font-synthesis: none; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.reading-title[lang="ja"] strong { font-family: var(--reader-font-japanese); }
 .reading-progress { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 24px; color: var(--reader-muted); font-size: 12px; border-bottom: 1px solid var(--reader-line); }
 #reader-progress { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .parallel-pages { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, var(--source-width)) 6px minmax(0, var(--translation-width)); }
@@ -50,15 +56,17 @@
 .reading-page-head strong { font-size: 14px; font-weight: 500; color: var(--reader-muted); }
 .reading-page-head small { color: var(--reader-muted); font-size: 12px; }
 .reading-page-head > div { display: flex; gap: 8px; }
-.reading-scroll { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; padding: 24px clamp(24px, 3vw, 56px) 72px; overscroll-behavior: contain; overflow-anchor: none; scroll-behavior: auto; }
-.reading-scroll p { position: relative; margin: 0 0 24px; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--reader-size)/1.95 "Source Han Serif SC", "SimSun", "Songti SC", "Georgia", serif; font-weight: 400; border-radius: 2px; }
+.reading-scroll { --reader-text-font: var(--reader-font-latin); flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; padding: 24px clamp(24px, 3vw, 56px) 72px; overscroll-behavior: contain; overflow-anchor: none; scroll-behavior: auto; }
+.reading-scroll[lang="ja"] { --reader-text-font: var(--reader-font-japanese); }
+.translated-page .reading-scroll { --reader-text-font: var(--reader-font-chinese); }
+.reading-scroll p { position: relative; margin: 0 0 24px; white-space: pre-wrap; overflow-wrap: anywhere; font: 400 var(--reader-size)/1.95 var(--reader-text-font); font-synthesis: none; border-radius: 2px; }
 .reading-scroll p:focus-visible { outline-offset: 6px; }
 .paragraph-number { position: absolute; left: -24px; top: 4px; color: var(--reader-muted); font: 10px/2 sans-serif; opacity: .65; user-select: none; }
 .reading-scroll .paragraph-active { background: color-mix(in srgb, var(--reader-ink) 8%, var(--reader-paper)); box-shadow: -4px 0 0 var(--reader-muted); }
-.reading-scroll .paragraph-pending { color: var(--reader-muted); font-family: inherit; font-size: 13px; min-height: 56px; border-bottom: 1px dashed var(--reader-line); }
+.reading-scroll .paragraph-pending { color: var(--reader-muted); font-family: var(--reader-text-font); font-size: 13px; min-height: 56px; border-bottom: 1px dashed var(--reader-line); }
 .reading-notice { color: var(--reader-muted); font-size: 13px; line-height: 1.7; margin-bottom: 24px; }
 .reading-notice:empty { display: none; }
-.reading-editor { flex: 1; min-height: 0; width: 100%; padding: 24px 32px; resize: none; border: 0; background: var(--reader-paper); color: var(--reader-ink); font: var(--reader-size)/1.95 "SimSun", serif; }
+.reading-editor { flex: 1; min-height: 0; width: 100%; padding: 24px 32px; resize: none; border: 0; background: var(--reader-paper); color: var(--reader-ink); font: 400 var(--reader-size)/1.95 var(--reader-font-chinese); font-synthesis: none; }
 .reading-room[data-mode="translation"] .original-page { display: none; }
 .reading-room[data-mode="translation"] .reader-divider { display: none; }
 .reading-room[data-mode="translation"] .parallel-pages { display: block; }

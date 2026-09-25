@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { readerSourceParagraphs, paragraphRevealDelta } from "../public/reader.js";
 
 const viewport = { top: 100, bottom: 700 };
@@ -19,13 +19,37 @@ assert.deepEqual(readerSourceParagraphs({ source: "", sourceParagraphs: [] }), [
 const mappedSource = [{ id: "stable-paragraph", text: "原文" }];
 assert.equal(readerSourceParagraphs({ source: "原文", sourceParagraphs: mappedSource }), mappedSource, "new source IDs remain unchanged");
 
-const app = await readFile(new URL("../public/app.js", import.meta.url), "utf8") + await readFile(new URL("../public/reader.js", import.meta.url), "utf8");
+const reader = await readFile(new URL("../public/reader.js", import.meta.url), "utf8");
+const app = await readFile(new URL("../public/app.js", import.meta.url), "utf8") + reader;
 const page = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const server = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
 const themeCss = await readFile(new URL("../public/themes.css", import.meta.url), "utf8");
-const css = themeCss + await readFile(new URL("../public/styles.css", import.meta.url), "utf8") + await readFile(new URL("../public/reader.css", import.meta.url), "utf8");
+const readerCss = await readFile(new URL("../public/reader.css", import.meta.url), "utf8");
+const css = themeCss + await readFile(new URL("../public/styles.css", import.meta.url), "utf8") + readerCss;
+const fontFamilies = ["noto-serif", "noto-serif-jp", "noto-serif-sc"];
+const fontStylesheets = fontFamilies.map((family) => new URL(`../public/assets/fonts/${family}/wght.css`, import.meta.url));
+for (const [index, stylesheet] of fontStylesheets.entries()) {
+  await access(new URL(`../public/assets/fonts/${fontFamilies[index]}/LICENSE`, import.meta.url));
+  const metadata = JSON.parse(await readFile(new URL(`../public/assets/fonts/${fontFamilies[index]}/package.json`, import.meta.url), "utf8"));
+  assert.equal(metadata.version, "5.3.0", `${fontFamilies[index]} provenance stays pinned`);
+  const fontCss = await readFile(stylesheet, "utf8");
+  assert.match(fontCss, /font-display:\s*swap/, `${stylesheet.pathname} lets text render while the bundled font loads`);
+  for (const match of fontCss.matchAll(/url\(([^)]+\.woff2)\)/g)) await access(new URL(match[1].replaceAll(/["']/g, ""), stylesheet));
+}
 
 assert.match(page, /rel="icon"[^>]*butterfly-peony-logo\.svg/, "the supplied logo is the favicon");
 assert.match(page, /class="brand-logo"/, "the brand rail shows the supplied logo");
+assert.match(page, /assets\/fonts\/noto-serif\/wght\.css\?v=5\.3\.0/, "Latin reading text uses a bundled font");
+assert.match(page, /assets\/fonts\/noto-serif-jp\/wght\.css\?v=5\.3\.0/, "Japanese reading text uses a bundled font");
+assert.match(page, /assets\/fonts\/noto-serif-sc\/wght\.css\?v=5\.3\.0/, "Chinese reading text uses a bundled font");
+assert.match(reader, /const sourceLang = sourceLanguage\(book\)/, "the reader normalizes the source language");
+assert.match(reader, /id="source-scroll"[^>]*lang="\$\{sourceLang\}"/, "the source text exposes its language to shaping and accessibility tools");
+assert.match(reader, /id="translation-scroll"[^>]*lang="zh-CN"/, "the translated text is explicitly Simplified Chinese");
+assert.match(readerCss, /--reader-font-latin:\s*"Noto Serif Variable"/, "Latin source languages share the bundled Latin serif");
+assert.match(readerCss, /--reader-font-japanese:\s*"Noto Serif JP Variable"/, "Japanese uses Japanese glyph forms");
+assert.match(readerCss, /--reader-font-chinese:\s*"Noto Serif SC Variable"/, "Chinese uses Simplified Chinese glyph forms");
+assert.match(readerCss, /font-synthesis:\s*none/, "the browser cannot fabricate mismatched reader weights");
+assert.match(server, /"\.woff2":\s*"font\/woff2"/, "bundled fonts are served with the correct MIME type");
 assert.match(css, /--blue:\s*#0D3B78/i, "the museum-inspired blue is a design token");
 assert.match(css, /prefers-reduced-motion/, "reduced motion is respected");
 assert.match(app, /继续阅读/, "library prioritizes a continuation action");
@@ -41,7 +65,7 @@ assert.match(css, /@media\s*\(max-width:\s*1024px\)/, "the medium viewport has a
 assert.match(css, /@media\s*\(max-width:\s*760px\)/, "the narrow viewport has an explicit layout");
 assert.match(css, /:focus-visible/, "keyboard focus is visible");
 assert.match(css, /min-height:\s*44px/, "controls have comfortable targets");
-assert.match(page, /app\.js\?v=1\.10\.0/, "the release busts old browser assets");
+assert.match(page, /app\.js\?v=1\.10\.1/, "the release busts old browser assets");
 assert.match(app, /function confirmDiscardReaderEdit/, "navigation protects unsaved edits");
 assert.match(app, /保存翻译 API 失败/, "translation settings errors are inline");
 assert.match(app, /保存搜索设置失败/, "search settings errors are inline");
