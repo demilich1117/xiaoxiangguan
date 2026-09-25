@@ -32,7 +32,7 @@ const EXPORTS = join(DATA_ROOT, "exports");
 const LIBRARY = join(DATA_ROOT, "library");
 const PORT = Number(process.env.PORT || 4327);
 const MAX_UPLOAD = 512 * 1024 * 1024;
-const mime = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml", ".epub": "application/epub+zip" };
+const mime = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml", ".woff2": "font/woff2", ".epub": "application/epub+zip" };
 
 await mkdir(DATA, { recursive: true });
 if (!existsSync(DATA_FILE)) await writeFile(DATA_FILE, '{"books":[],"exports":[]}\n', { encoding: "utf8", flag: "wx" }).catch((error) => { if (error.code !== "EEXIST") throw error; });
