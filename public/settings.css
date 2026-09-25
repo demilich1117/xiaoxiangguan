@@ -4,9 +4,10 @@
   gap: 16px;
   align-items: start;
 }
-.storage-panel code { display: block; padding: 10px 12px; overflow-wrap: anywhere; color: var(--blue); background: #f4f7fb; }
+.storage-panel code { display: block; padding: 10px 12px; overflow-wrap: anywhere; color: var(--blue); background: var(--surface-soft); }
+.lifecycle-panel { order: 4; }
 .storage-panel p:last-child { margin-bottom: 0; color: var(--muted); font-size: 13px; }
-.settings-form > label {
+.settings-form > label, #http-settings > label, #cli-settings > label {
   display: grid;
   gap: 7px;
   color: var(--muted);
@@ -29,9 +30,9 @@
 .preset-note {
   margin: 10px 0 16px;
   padding: 12px 14px;
-  border: 1px solid rgba(126, 108, 93, .18);
+  border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(247, 243, 237, .72);
+  background: var(--surface-soft);
   color: var(--muted);
   font-size: 12px;
   line-height: 1.65;
@@ -54,7 +55,7 @@
 .glossary-filters select { width: 100%; }
 .glossary-filters span { margin-left: auto; color: var(--muted); font-size: 12px; }
 .verify-links { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
-.verify-links a { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.verify-links a { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
 .dialog-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .dialog-title h2 { margin: 0; }
 .dialog-form label { display: grid; gap: 6px; margin-top: 12px; color: var(--muted); font-size: 12px; }
@@ -66,7 +67,7 @@
 .settings-advanced summary { padding: 13px 4px; color: var(--blue); font-weight: 600; cursor: pointer; }
 .settings-advanced[open] { padding-bottom: 16px; }
 .settings-advanced > label { display: grid; gap: 7px; margin: 12px 0; }
-.preset-note { border-radius: 2px; background: #F7F9FC; border-color: var(--line); font-size: 13px; }
+.preset-note { border-radius: 2px; background: var(--surface-soft); border-color: var(--line); font-size: 13px; }
 .task-actions button { min-height: 44px; font-size: 13px; }
 .glossary-filters label, .dialog-form label { font-size: 14px; }
 .dialog-form textarea { border-radius: 2px; }
@@ -77,3 +78,5 @@
   .glossary-filters { flex-wrap: wrap; }
   .glossary-filters label { min-width: 100%; }
 }
+
+.storage-panel { order: 3; }

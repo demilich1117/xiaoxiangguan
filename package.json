@@ -1,12 +1,14 @@
 {
   "name": "xiaoxiangguan",
-  "version": "1.8.0",
+  "version": "1.10.0",
   "private": true,
   "license": "GPL-3.0-only",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node scripts/test.mjs && node scripts/test-verification.mjs && node scripts/test-research.mjs && node scripts/test-search-budget.mjs && node scripts/test-revisions.mjs && node scripts/test-reader-quality.mjs && node scripts/test-reader-mode.mjs && node scripts/test-refinement.mjs && node scripts/test-portability.mjs && node scripts/test-tool-paths.mjs && node scripts/test-fresh-install.mjs && node scripts/test-reader-ui.mjs && node --check public/app.js"
+    "test": "node scripts/test.mjs && node scripts/test-verification.mjs && node scripts/test-research.mjs && node scripts/test-search-budget.mjs && node scripts/test-revisions.mjs && node scripts/test-reader-quality.mjs && node scripts/test-reader-mode.mjs && node scripts/test-refinement.mjs && node scripts/test-portability.mjs && node scripts/test-tool-paths.mjs && node scripts/test-fresh-install.mjs && node scripts/test-reader-ui.mjs && node --check public/app.js && node scripts/test-translation-integrity.mjs && node scripts/test-cli-provider.mjs && node scripts/test-lifecycle.mjs && node --check public/reader.js"
   }
 }

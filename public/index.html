@@ -4,9 +4,12 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>瀟湘館</title>
+  <script>try { const theme = localStorage.getItem("xxg:theme"); document.documentElement.dataset.workbenchTheme = ["porcelain", "bamboo", "paper", "lamplight"].includes(theme) ? theme : "porcelain"; } catch { document.documentElement.dataset.workbenchTheme = "porcelain"; }</script>
   <link rel="icon" type="image/svg+xml" href="/assets/butterfly-peony-logo.svg"/>
-  <link rel="stylesheet" href="/styles.css?v=1.8.0"/>
-  <link rel="stylesheet" href="/settings.css?v=1.8.0"/>
+  <link rel="stylesheet" href="/styles.css?v=1.10.0"/>
+  <link rel="stylesheet" href="/settings.css?v=1.10.0"/>
+  <link rel="stylesheet" href="/reader.css?v=1.10.0"/>
+  <link rel="stylesheet" href="/themes.css?v=1.10.0"/>
 </head>
 <body>
   <div class="app-shell">
@@ -19,7 +22,7 @@
         <button class="nav-item" data-view="exports"><span aria-hidden="true">04</span>导出</button>
         <button class="nav-item" data-view="settings"><span aria-hidden="true">05</span>设置</button>
       </nav>
-      <div class="sidebar-foot"><span class="foot-rule" aria-hidden="true"></span><div id="local-status" class="local-status">正在检查本地能力…</div><small>资料保存在本机</small></div>
+      <div class="sidebar-foot"><span class="foot-rule" aria-hidden="true"></span><div id="local-status" class="local-status">正在检查本地能力…</div><small>资料保存在本机</small><button id="shutdown-server" class="shutdown-link">关闭后台</button></div>
     </aside>
     <main class="main">
       <header class="topbar">
@@ -33,7 +36,7 @@
 
   <dialog id="import-dialog">
     <form id="import-form" method="dialog" autocomplete="off">
-      <div class="dialog-head"><div><p class="eyebrow">新建项目</p><h2>导入书籍</h2></div><button class="icon-button" type="button" data-close-dialog="import-dialog">×</button></div>
+      <div class="dialog-head"><div><p class="eyebrow">新建项目</p><h2>导入书籍</h2></div><button class="icon-button" type="button" data-close-dialog="import-dialog" aria-label="关闭导入窗口">×</button></div>
       <label class="drop-zone" id="drop-zone"><input id="book-file" type="file" accept=".pdf,.epub,.azw3" required/><strong>选择 PDF、EPUB 或 AZW3</strong><span id="file-hint">原文件会复制到本地书库，不会被修改</span></label>
       <div class="form-grid"><label>书名<input id="book-title" placeholder="可在选择文件后修改"/></label><label>作者<input id="book-author" placeholder="可留空"/></label></div>
       <div class="form-grid"><label>原文语种<select id="book-language"></select></label><label>翻译风格<select id="book-profile"><option>自动判断</option><option>现代文学</option><option>古典文学</option><option>学术文献</option></select></label></div>
@@ -54,6 +57,6 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
-  <script type="module" src="/app.js?v=1.8.0"></script>
+  <script type="module" src="/app.js?v=1.10.0"></script>
 </body>
 </html>
