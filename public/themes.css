@@ -113,7 +113,6 @@ a { color: var(--blue); }
   .top-actions .theme-trigger { order: 2; }
   .top-actions .search { min-width: 140px; }
   .theme-trigger-caption { display: none; }
-  .reading-toolbar .theme-trigger { grid-column: 1; grid-row: 2; }
   .theme-dialog { padding: 20px; }
   .theme-choices { gap: 10px; }
   .theme-choice { padding: 12px; column-gap: 4px; }

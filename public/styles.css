@@ -51,6 +51,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--blue); box-shado
 .book-meta > p { margin: 0 0 12px; color: var(--muted); }
 .tags, .saved-scopes { display: flex; flex-wrap: wrap; gap: 6px; }
 .tag, .status { display: inline-flex; align-items: center; padding: 3px 8px; color: var(--muted); border-radius: 999px; background: var(--surface-soft); font-size: 11px; }
+.status { gap: 6px; white-space: nowrap; vertical-align: middle; }
+.status-icon { width: 16px; height: 16px; flex: none; }
 .status.approved { color: var(--green); background: var(--green-soft); }
 .status.review, .status.drafted { color: var(--amber); background: var(--amber-soft); }
 .status.failed { color: var(--red); background: var(--red-soft); }

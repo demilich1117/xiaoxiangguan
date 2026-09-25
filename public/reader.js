@@ -1,5 +1,6 @@
 import { themeButton } from "./themes.js";
 import { sourceLanguage } from "./languages.js";
+import { statusIcon, statusBadge } from "./status-badge.js";
 
 export function readingState(bookId) {
   try { return JSON.parse(localStorage.getItem(`reader:${bookId}`) || "{}"); } catch { return {}; }
@@ -28,7 +29,7 @@ export function paragraphRevealDelta(paragraph, viewport, inset = 16) {
 }
 
 export function mountReader({ container, book, chapter, request, notify, navigate, back, configure, start, save, analyze, exportBook, onChapter, shutdown }) {
-  let current = chapter, disposed = false, editing = false, follow = false, syncLock = false, deferred = null;
+  let current = chapter, disposed = false, editing = false, approving = false, follow = false, syncLock = false, deferred = null;
   const prefs = { mode: "parallel", ratio: 50, fontSize: 18, sync: true, theme: "auto", ...readingState(book.id) };
   const narrow = matchMedia("(max-width: 760px)"); let mobileSide = "source";
   const sourceLang = sourceLanguage(book);
@@ -38,7 +39,8 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   const legacyServer = !Array.isArray(chapter.sourceParagraphs);
   container.innerHTML = `<section class="reading-room" data-mode="${escape(prefs.mode)}" data-mobile-side="source" data-theme="${escape(prefs.theme)}">
     <header class="reading-toolbar">
-      <button id="reader-back" aria-label="返回章节目录">← 目录</button>
+      <button id="reader-back" aria-label="返回作品页">← 作品页</button>
+      <button id="reader-toc" aria-haspopup="dialog" aria-controls="reader-catalog" aria-expanded="false">目录</button>
       <div class="reading-title" lang="${sourceLang}"><small>${escape(book.title)}</small><strong>${escape(chapter.title)}</strong></div>
       <button id="reader-previous" ${index < 1 ? "disabled" : ""} aria-label="上一章">上一章</button><button id="reader-next" ${index >= book.chapters.length - 1 ? "disabled" : ""} aria-label="下一章">下一章</button>
       <button id="reader-mode" class="desktop-control">只看译文</button><button id="reader-side" class="mobile-control">看译文</button>${themeButton()}<button id="reader-options">阅读设置</button><button id="reader-tools">注释与工具</button>
@@ -47,17 +49,21 @@ export function mountReader({ container, book, chapter, request, notify, navigat
     <div class="parallel-pages">
       <section class="reading-page original-page" aria-label="原文"><div class="reading-page-head"><strong>原文</strong><small>${visibleSource.length} 段 · ${sourceLang}</small></div><div id="source-scroll" class="reading-scroll" lang="${sourceLang}" tabindex="0">${visibleSource.map((p, i) => `<p ${p.id ? `data-ids="${escape(p.id)}"` : ""} tabindex="0"><span class="paragraph-number" aria-hidden="true">${i + 1}</span>${escape(p.text)}</p>`).join("") || '<p>原文尚未提取，请返回目录整理章节。</p>'}</div></section>
       <div id="reader-divider" class="reader-divider desktop-control" role="separator" tabindex="0" aria-label="调整原译栏宽" aria-orientation="vertical" aria-valuemin="30" aria-valuemax="70" aria-valuenow="${prefs.ratio}"></div>
-      <section class="reading-page translated-page" aria-label="中文译文"><div class="reading-page-head"><strong>中文译文</strong><div><button class="primary" id="translate-range">${chapter.translation ? "重新翻译" : "翻译本章"}</button><button id="edit-translation">${chapter.translation ? "编辑译文" : "手工写入译文"}</button><button id="cancel-edit" hidden>取消编辑</button><button id="save-draft" hidden>保存修改</button></div></div>
+      <section class="reading-page translated-page" aria-label="中文译文"><div class="reading-page-head"><strong>中文译文</strong><div><button class="primary" id="translate-range">${chapter.translation ? "重新翻译" : "翻译本章"}</button><button id="edit-translation">${chapter.translation ? "编辑译文" : "手工写入译文"}</button><button id="approve">${statusIcon("approved")}<span id="approve-label">标记定稿</span></button><button id="cancel-edit" hidden>取消编辑</button><button id="save-draft" hidden>保存修改</button></div></div>
         <div id="translation-scroll" class="reading-scroll" lang="zh-CN" tabindex="0"><div id="alignment-notice" class="reading-notice"></div><div id="translation-read"></div></div>
         <textarea id="translation" class="reading-editor" lang="zh-CN" aria-label="编辑中文译文" hidden>${escape(chapter.translation || "")}</textarea>
       </section>
     </div>
     <nav class="reader-chapter-nav mobile-control" aria-label="章节导航"><button id="mobile-previous" ${index < 1 ? "disabled" : ""}>← 上一章</button><span>${index + 1} / ${book.chapters.length}</span><button id="mobile-next" ${index >= book.chapters.length - 1 ? "disabled" : ""}>下一章 →</button></nav>
     <dialog id="reader-settings"><div class="dialog-head"><h2>阅读设置</h2><button data-close aria-label="关闭阅读设置">×</button></div><label>字号 <input id="reader-font" type="range" min="15" max="28" value="${prefs.fontSize}"/></label><label class="desktop-control">左侧栏宽 <input id="reader-ratio" type="range" min="30" max="70" value="${prefs.ratio}"/></label><label class="check-line"><input id="reader-sync" type="checkbox" ${prefs.sync ? "checked" : ""}/>按段落同步滚动</label><label>纸张<select id="reader-theme"><option value="auto">随工作台</option><option value="paper">纸白</option><option value="warm">暖纸</option><option value="night">夜读</option></select></label></dialog>
-    <dialog id="reader-drawer"><div class="dialog-head"><h2>章节工具</h2><button data-close aria-label="关闭章节工具">×</button></div><label>章节目录<select id="reader-chapters">${book.chapters.map((c) => `<option value="${escape(c.id)}" ${c.id === chapter.id ? "selected" : ""}>${escape(c.title)}</option>`).join("")}</select></label>
+    <dialog id="reader-catalog" class="reader-catalog" aria-labelledby="reader-catalog-title">
+      <div class="dialog-head"><div><h2 id="reader-catalog-title">章节目录</h2><p class="reader-catalog-book">${escape(book.title)}</p></div><button data-close aria-label="关闭章节目录">×</button></div>
+      <nav class="reader-catalog-list" aria-label="本书章节">${book.chapters.map((c, i) => `<button class="reader-catalog-item" data-catalog-chapter="${escape(c.id)}" ${c.id === chapter.id ? 'aria-current="page"' : ""}><span class="reader-catalog-title"><small>${i + 1} / ${book.chapters.length}${c.id === chapter.id ? " · 正在阅读" : ""}</small><span>${escape(c.title)}</span></span><span class="reader-catalog-status">${statusBadge(c.id === chapter.id ? chapter.status : c.status)}</span></button>`).join("")}</nav>
+    </dialog>
+    <dialog id="reader-drawer"><div class="dialog-head"><h2>章节工具</h2><button data-close aria-label="关闭章节工具">×</button></div>
       <label>书内搜索<input id="reader-search" type="search" placeholder="查找原文或译文"/></label><div id="reader-search-results" aria-live="polite"></div>
       <details><summary>翻译段落或页码</summary><label>范围<select id="range-type"><option value="paragraphs">段落范围</option>${book.format === "PDF" ? '<option value="pages">PDF 页码</option>' : ""}</select></label><div class="form-grid"><label>起始<input id="range-start" type="number" min="1" value="1"/></label><label>结束<input id="range-end" type="number" min="1" value="1"/></label></div><button id="translate-selection">翻译此范围</button><p>节选单独保存，保留本章主译文。</p></details>
-      <div class="reader-tool-actions"><button id="refine-translation" ${!chapter.translation ? "disabled" : ""}>精校本章</button><button id="approve" ${!chapter.translation ? "disabled" : ""}>标记定稿</button><button id="analyze-chapter">分析注释</button><button id="reader-export" ${!chapter.translation ? "disabled" : ""}>导出本章</button><button id="reader-engine">选择翻译引擎</button></div>
+      <div class="reader-tool-actions"><button id="refine-translation" ${!chapter.translation ? "disabled" : ""}>精校本章</button><button id="analyze-chapter">分析注释</button><button id="reader-export" ${!chapter.translation ? "disabled" : ""}>导出本章</button><button id="reader-engine">选择翻译引擎</button></div>
       <details><summary>译名与注释</summary>${[...(book.glossary || []), ...(book.termCandidates || []), ...(book.characters || []), ...(book.characterCandidates || [])].filter((t) => chapter.source?.includes(t.japanese || t.japaneseName)).map((t) => `<p><strong>${escape(t.japanese || t.japaneseName)} → ${escape(t.chinese || t.chineseName)}</strong><br/>${escape(t.definition || t.note || t.identity || "尚无释义")}</p>`).join("") || '<p>本章暂无注释。</p>'}</details>
       <details><summary>版本历史</summary><div id="reader-revisions"></div></details><details><summary>章节信息与用量</summary><p>${escape(chapter.sourceLocator || "无来源位置")}</p><p id="reader-usage"></p><p id="reader-quality"></p></details><details><summary>节选译文</summary><div id="reader-segments"></div></details>
       <div class="reader-tool-actions"><button id="reader-shutdown">关闭后台</button><small>关闭网页后后台仍会继续运行。</small></div>
@@ -65,6 +71,12 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   </section>`;
   const $ = (selector) => container.querySelector(selector);
   const room = $(".reading-room"), sourcePane = $("#source-scroll"), translatedPane = $("#translation-scroll"), read = $("#translation-read"), editor = $("#translation");
+  const syncApproval = () => {
+    $("#approve").hidden = editing;
+    $("#approve").disabled = approving || !current.translation?.trim() || current.status === "approved";
+    $("#approve").setAttribute("aria-busy", String(approving));
+    $("#approve-label").textContent = approving ? "正在定稿…" : current.status === "approved" ? "已定稿" : "标记定稿";
+  };
   let lastPane = prefs.anchor?.side === "translation" ? translatedPane : sourcePane;
   const remember = (patch) => { Object.assign(prefs, patch); rememberReading(book.id, { ...patch, chapterId: chapter.id }); };
   const applyPrefs = () => { room.dataset.mode = prefs.mode; room.dataset.mobileSide = mobileSide; room.dataset.theme = prefs.theme; room.style.setProperty("--reader-size", `${prefs.fontSize}px`); room.style.setProperty("--source-width", `${prefs.ratio}fr`); room.style.setProperty("--translation-width", `${100 - prefs.ratio}fr`); $("#reader-mode").textContent = prefs.mode === "parallel" ? "只看译文" : "原译对照"; $("#reader-side").textContent = mobileSide === "source" ? "看译文" : "看原文"; };
@@ -145,6 +157,21 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   const openDialog = (id) => { stopFollow(); $(id).showModal(); };
   container.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => b.closest("dialog").close());
   $("#reader-back").onclick = back;
+  $("#reader-toc").onclick = () => {
+    openDialog("#reader-catalog"); $("#reader-toc").setAttribute("aria-expanded", "true");
+    const activeChapter = $("#reader-catalog [aria-current='page']");
+    activeChapter?.scrollIntoView({ block: "center" }); activeChapter?.focus({ preventScroll: true });
+  };
+  $("#reader-catalog").addEventListener("close", () => $("#reader-toc").setAttribute("aria-expanded", "false"));
+  $("#reader-catalog").addEventListener("click", (event) => {
+    if (event.target !== $("#reader-catalog")) return;
+    const bounds = event.target.getBoundingClientRect();
+    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) event.target.close();
+  });
+  container.querySelectorAll("[data-catalog-chapter]").forEach((button) => button.onclick = () => {
+    $("#reader-catalog").close();
+    if (button.dataset.catalogChapter !== chapter.id) navigate(button.dataset.catalogChapter);
+  });
   $("#reader-previous").onclick = () => navigate(book.chapters[index - 1].id);
   $("#reader-next").onclick = () => navigate(book.chapters[index + 1].id);
   $("#mobile-previous").onclick = $("#reader-previous").onclick; $("#mobile-next").onclick = $("#reader-next").onclick;
@@ -175,12 +202,15 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   $("#reader-follow").onclick = () => { follow = true; jumpLatest(); $("#reader-follow").hidden = true; };
   $("#reader-engine").onclick = configure; $("#analyze-chapter").onclick = analyze; $("#reader-export").onclick = exportBook;
   $("#reader-shutdown").onclick = () => { $("#reader-drawer").close(); shutdown?.(); };
-  $("#reader-chapters").onchange = (event) => navigate(event.target.value);
-  const setEditing = (value) => { editing = value; stopFollow(); editor.hidden = !value; translatedPane.hidden = value; $("#edit-translation").hidden = value; $("#cancel-edit").hidden = !value; $("#save-draft").hidden = !value; if (value) { editor.value = current.translation || ""; mobileSide = "translation"; applyPrefs(); editor.focus(); } else if (deferred) { const next = deferred; deferred = null; update(next); } };
+  const setEditing = (value) => { editing = value; syncApproval(); stopFollow(); editor.hidden = !value; translatedPane.hidden = value; $("#edit-translation").hidden = value; $("#cancel-edit").hidden = !value; $("#save-draft").hidden = !value; if (value) { editor.value = current.translation || ""; mobileSide = "translation"; applyPrefs(); editor.focus(); } else if (deferred) { const next = deferred; deferred = null; update(next); } };
   $("#edit-translation").onclick = () => setEditing(true);
   $("#cancel-edit").onclick = () => { if (editor.value !== (current.translation || "") && !confirm("放弃未保存的修改？")) return; setEditing(false); };
   $("#save-draft").onclick = async () => { if (await save(editor.value, "review")) { setEditing(false); } };
-  $("#approve").onclick = async () => { if (editing) return notify("请先保存修改"); await save(undefined, "approved"); };
+  $("#approve").onclick = async () => {
+    if (editing || approving || !current.translation?.trim() || current.status === "approved") return;
+    approving = true; syncApproval();
+    try { await save(undefined, "approved"); } finally { approving = false; syncApproval(); }
+  };
   $("#reader-search").oninput = () => { clearTimeout(searchTimer); const query = $("#reader-search").value.trim(); searchTimer = setTimeout(async () => { try { if (!query) { $("#reader-search-results").replaceChildren(); return; } const results = await request(`/api/books/${book.id}/search?q=${encodeURIComponent(query)}`); if (disposed || query !== $("#reader-search").value.trim()) return; $("#reader-search-results").innerHTML = results.map((r, i) => `<button data-search-result="${i}"><strong>${escape(r.title)}</strong><small>${escape(r.snippet)}</small></button>`).join("") || "未找到匹配内容"; container.querySelectorAll("[data-search-result]").forEach((b) => b.onclick = () => { const r = results[Number(b.dataset.searchResult)]; navigate(r.chapterId, { paragraphId: r.paragraphId, offset: 0 }); }); } catch (e) { notify(e.message); } }, 250); };
   const reconcile = (segments) => {
     const anchor = capture(translatedPane); const old = new Map([...read.children].map((p) => [p.dataset.key, p]));
@@ -209,6 +239,8 @@ export function mountReader({ container, book, chapter, request, notify, navigat
     $("#reader-retry").hidden = active || !run || !["failed", "cancelled"].includes(run.status);
     if (editing || (!getSelection().isCollapsed && container.contains(getSelection().anchorNode))) { deferred = next; return; }
     current = next; onChapter(next); editor.value = next.translation || "";
+    const catalogStatus = $("#reader-catalog [aria-current='page'] .reader-catalog-status");
+    if (catalogStatus.dataset.status !== String(next.status)) { catalogStatus.innerHTML = statusBadge(next.status); catalogStatus.dataset.status = String(next.status); }
     $("#translate-range").textContent = next.translation ? "重新翻译" : "翻译本章";
     $("#edit-translation").textContent = next.translation ? "编辑译文" : "手工写入译文";
     const completed = (run?.blocks || []).filter((b) => b.status === "completed").flatMap((b) => b.segments);
@@ -222,7 +254,8 @@ export function mountReader({ container, book, chapter, request, notify, navigat
     $("#alignment-notice").textContent = next.alignmentStatus === "legacy" ? "此版本保留章级对照，尚无可靠段落映射。重新初译可建立对齐，旧版会保留。" : next.translation && run && active ? "新译稿正在后台生成；当前版本保持可读。" : preview ? "已完成的段落已保存，余下内容继续翻译。" : "";
     $("#reader-usage").textContent = next.usage?.inputTokens == null ? "用量未知" : `输入 ${next.usage.inputTokens} / 输出 ${next.usage.outputTokens ?? "未知"} · ${next.lastModel || ""}`;
     $("#reader-quality").textContent = next.analysis ? `注释分析覆盖 ${next.analysis.analyzedCharacters}/${next.analysis.sourceCharacters} 字` : next.translation ? "尚未检查" : "尚未翻译";
-    for (const id of ["approve", "refine-translation", "reader-export"]) $(`#${id}`).disabled = !next.translation;
+    syncApproval();
+    for (const id of ["refine-translation", "reader-export"]) $(`#${id}`).disabled = !next.translation;
     const revisionsKey = JSON.stringify([next.revisionHistory, next.activeRevisionId]);
     if (revisionsKey !== revisionSignature) {
     revisionSignature = revisionsKey;
