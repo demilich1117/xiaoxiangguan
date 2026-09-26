@@ -1,5 +1,6 @@
 import { discoverCliModels, validateCliChoice } from "./lib/cli-models.mjs";
 import { probeCli } from "./lib/cli-provider.mjs";
+import { providerSnapshot } from "./lib/providers.mjs";
 import { OpenCodeServer, usesOpenCodeServer, discoverOpenCodeServerModels, probeOpenCodeServer, stopOpenCodeSessions } from "./lib/opencode-server.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { sourceParagraphs, sourceFingerprint, revisionSegments, DEFAULT_TRANSLATION_BLOCK_CHARS, validateTranslationBlockChars } from "./lib/alignment.mjs";
@@ -313,7 +314,7 @@ async function startTask(bookId, type, detail, runner, metadata = {}) {
       try {
         await waitControl(control); control.started = true; await updateTask(task.id, { status: "running" }); console.log(`任务开始：${type}`);
         await runner(task, control); checkControl(control); await updateTask(task.id, { status: "completed", progress: 100 }); console.log(`任务完成：${type}`);
-      } catch (error) { await updateTask(task.id, { status: control.cancelled ? "cancelled" : "failed", error: error.message, detail: `${detail} · ${error.message}` }); console.log(`任务${control.cancelled ? "已停止" : "未完成"}：${type}`); }
+      } catch (error) { await updateTask(task.id, { status: control.cancelled ? "cancelled" : "failed", error: error.message, errorCode: error.code, detail: `${detail} · ${error.message}` }); console.log(`任务${control.cancelled ? "已停止" : "未完成"}：${type}`); }
       finally { taskControls.delete(task.id); }
     }));
     return task;
@@ -368,9 +369,7 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
   // Freeze configuration when queued; never persist API keys in task or block metadata.
   const provider = await readProvider();
   if (provider.backend && provider.backend !== "http") validateCliChoice(provider, provider.reasoningEffort ? await discoverProviderModels(provider) : null);
-  const engine = { reasoningEffort: provider.reasoningEffort || "", backend: provider.backend || "http", protocol: provider.protocol, model: provider.model, baseUrl: provider.baseUrl, maxOutputTokens: provider.maxOutputTokens, inputPrice: provider.inputPrice, outputPrice: provider.outputPrice, cliPath: provider.cliPath || "" };
-  if (usesOpenCodeServer(provider)) Object.assign(engine, { opencodeMode: "server", opencodeServerUrl: provider.opencodeServerUrl, opencodeDirectory: provider.opencodeDirectory });
-  engine.translationBlockChars = provider.translationBlockChars;
+  const engine = providerSnapshot(provider);
   return startTask(bookId, mode === "refine" ? "译文精校" : "章节翻译", `${chapterId} · ${rangeLabel}`, async (task, control) => {
     let data = await readLibrary(); let book = data.books.find((i) => i.id === bookId); let chapter = book?.chapters.find((i) => i.id === chapterId); if (!chapter) throw new Error("章节不存在");
     const root = bookRoot(book); const fullSource = await readChapterText(root, chapter, "source"); if (!fullSource.trim()) throw new Error("本章没有可翻译原文");
@@ -389,9 +388,10 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
     // Older runs used 6500 characters. Resume with the original boundaries even after settings change.
     const previousEngine = oldRun && { ...oldRun.engine, translationBlockChars: oldRun.engine?.translationBlockChars ?? 6500 };
     if (retry && previousEngine) engine.translationBlockChars = provider.translationBlockChars = previousEngine.translationBlockChars;
-    const compatible = oldRun && oldRun.fingerprint === fingerprint && oldRun.mode === mode && oldRun.baseRevisionId === startingRevisionId && JSON.stringify(previousEngine) === JSON.stringify(engine) && oldRun.partial === selected.partial && JSON.stringify(oldRun.range) === JSON.stringify(selected.range || { type: "whole" });
-    if (retry && !compatible) throw new Error("原文、当前版本或引擎已变化，请重新开始翻译");
-    const run = { id: task.id, mode, partial: selected.partial, range: selected.range || { type: "whole" }, fingerprint, baseRevisionId: startingRevisionId, engine, blocks: retry && compatible ? oldRun.blocks.filter((b) => b.status === "completed") : [], status: "running" };
+    const compatible = oldRun && oldRun.fingerprint === fingerprint && oldRun.mode === mode && oldRun.baseRevisionId === startingRevisionId && oldRun.partial === selected.partial && JSON.stringify(oldRun.range) === JSON.stringify(selected.range || { type: "whole" });
+    if (retry && !compatible) throw new Error("原文、当前译稿版本或翻译范围已变化，无法沿用旧断点；请重新开始翻译");
+    const run = { id: task.id, mode, partial: selected.partial, range: selected.range || { type: "whole" }, fingerprint, baseRevisionId: startingRevisionId, engine, blocks: retry && compatible ? (oldRun.blocks || []).filter((b) => b.status === "completed").map((b) => ({ ...b, engine: b.engine || previousEngine })) : [], status: "running" };
+    await updateTask(task.id, { engine });
     await withBookMutation(bookId, async () => {
       checkControl(control); const latest = await readLibrary(); const current = latest.books.find((b) => b.id === bookId)?.chapters.find((c) => c.id === chapterId);
       current.sourceParagraphs = allParagraphs; current.translationRun = run;
@@ -420,7 +420,7 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
         if (selected.partial) {
           chapter.segments ||= []; chapter.segments.unshift({ id: `segment-${revisionId}`, label: selected.label, range: selected.range, sourceParagraphIds: paragraphs.map((p) => p.id), segments: result.segments, source: selected.source, translationPath: outputPath, status: "review", createdAt: new Date().toISOString() });
         } else {
-          chapter.revisionHistory.push({ id: revisionId, path: outputPath, origin: "ai", segments: result.segments, engine, createdAt: new Date().toISOString(), reason: protectedRevision ? "新译稿已保留，读者版本未覆盖；可在历史中采用" : mode === "refine" ? "AI 精校" : "AI 初译" });
+          chapter.revisionHistory.push({ id: revisionId, path: outputPath, origin: "ai", segments: result.segments, engine, blockEngines: result.blocks.map((b) => ({ id: b.id, sourceParagraphIds: b.sourceParagraphIds, engine: b.engine })), createdAt: new Date().toISOString(), reason: protectedRevision ? "新译稿已保留，读者版本未覆盖；可在历史中采用" : mode === "refine" ? "AI 精校" : "AI 初译" });
           if (!protectedRevision) {
             if (mode === "refine") chapter.polishedPath = outputPath; else chapter.translationPath = outputPath;
             chapter.activeRevisionId = revisionId; chapter.revisionId = revisionId; chapter.draftOrigin = "ai"; chapter.status = "review"; chapter.exportedAt = null;
@@ -432,7 +432,7 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
         for (const key of ["inputTokens", "outputTokens", "estimatedCost"]) chapter.usage[key] = result[key] == null ? null : (chapter.usage[key] || 0) + result[key];
         checkControl(control); await saveLibrary(data); await syncProjectState(book);
       });
-    } catch (error) { run.error = error.message; await persistRun(control.cancelled ? "cancelled" : "failed"); throw error; }
+    } catch (error) { run.error = error.message; run.errorCode = error.code; await persistRun(control.cancelled ? "cancelled" : "failed"); throw error; }
     // Analysis is a separate, cancellable stage; it never replaces the adopted reader revision.
     if (mode === "draft" && !selected.partial && run.adopted) {
       try {
